@@ -23,6 +23,14 @@ func TestClassifyError_CSRFExpired(t *testing.T) {
 	}
 }
 
+func TestClassifyError_CSRFExpiredViaGatewayError(t *testing.T) {
+	body := []byte(`{"error":{"GATEWAY_ERROR":"invalid api token"}}`)
+	err := classifyError("favorite_song.remove", 200, body)
+	if err == nil || err.Kind != ErrCSRFExpired {
+		t.Errorf("got %+v, want ErrCSRFExpired", err)
+	}
+}
+
 func TestClassifyError_AuthFailed(t *testing.T) {
 	body := []byte(`{"error":{"GATEWAY_ERROR":"NEED_USER_AUTH_REQUIRED"}}`)
 	err := classifyError("deezer.getUserData", 200, body)

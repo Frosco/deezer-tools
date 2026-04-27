@@ -104,8 +104,11 @@ func classifyError(method string, status int, body []byte) *GatewayError {
 		case "VALID_TOKEN_REQUIRED", "CSRF_TOKEN_INVALID":
 			return &GatewayError{Kind: ErrCSRFExpired, Method: method, Status: status, Message: msg}
 		case "GATEWAY_ERROR":
-			if msg == "NEED_USER_AUTH_REQUIRED" || msg == "USER_AUTH_REQUIRED" {
+			switch msg {
+			case "NEED_USER_AUTH_REQUIRED", "USER_AUTH_REQUIRED":
 				return &GatewayError{Kind: ErrAuthFailed, Method: method, Status: status, Message: msg}
+			case "invalid api token":
+				return &GatewayError{Kind: ErrCSRFExpired, Method: method, Status: status, Message: msg}
 			}
 		case "DATA_ERROR":
 			return &GatewayError{Kind: ErrNotFound, Method: method, Status: status, Message: msg}
