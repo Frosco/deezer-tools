@@ -20,6 +20,7 @@ type Client struct {
 	httpClient *http.Client
 	arl        string
 	apiToken   string
+	userID     string
 	baseURL    string
 }
 
