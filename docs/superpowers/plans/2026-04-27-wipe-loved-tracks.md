@@ -1009,8 +1009,10 @@ The research doc is now available on `main` for reference but does not appear in
 CSRF token is obtained via `deezer.getUserData`. The Client caches the token in `c.apiToken` and refreshes when classification surfaces `ErrCSRFExpired`.
 
 The flow:
-1. `ensureCSRF(ctx)` — if `c.apiToken == ""`, call `deezer.getUserData` with empty api_token, parse `checkForm` and `USER.USER_ID`, store both.
+1. `ensureCSRF(ctx)` — if `c.apiToken == ""`, call `deezer.getUserData` with the literal-string api_token `"null"` (per the gw-light protocol — see the research doc), parse `checkForm` and `USER.USER_ID`, store both.
 2. `refreshCSRF(ctx)` — same as above, but always re-fetch.
+
+**Protocol note from research:** for the very first `deezer.getUserData` call (and only for that method), the gateway expects the api_token query param to be the literal four-character string `"null"`, not an empty string. We handle this by setting `c.apiToken = "null"` immediately before the `Call` and overwriting with the real `checkForm` after.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1227,11 +1229,12 @@ func (c *Client) ensureCSRF(ctx context.Context) error {
 }
 
 // refreshCSRF unconditionally re-fetches the CSRF token and user id by
-// calling deezer.getUserData. The first call uses an empty api_token; the
-// gateway accepts that for this specific method.
+// calling deezer.getUserData. The first call uses the literal-string
+// api_token "null" — per the gw-light protocol, that's what the gateway
+// expects for the bootstrap call to this specific method.
 func (c *Client) refreshCSRF(ctx context.Context) error {
 	prev := c.apiToken
-	c.apiToken = ""
+	c.apiToken = "null"
 	raw, err := c.Call(ctx, "deezer.getUserData", nil)
 	if err != nil {
 		c.apiToken = prev
@@ -1307,9 +1310,14 @@ git commit -m "feat(gateway): acquire and refresh CSRF token via deezer.getUserD
 - Create: `internal/gateway/tracks.go` (initial: list method only; remove method in Task 8)
 - Create: `internal/gateway/tracks_test.go`
 
-`ListFavoriteSongs(ctx)` paginates through the user's loved songs. Uses `c.userID` populated by Task 6's CSRF flow.
+`ListFavoriteSongs(ctx)` paginates through the user's loved songs. CSRF acquisition (Task 6) is required before the first call but `c.userID` is **not** needed by either of the two methods used here — `song.getFavoriteIds` and `song.getListData` both scope by the `arl` cookie.
 
-**Method name and field names** come from the research doc (Task 5). The names used below match the most-common OSS reference at the time of writing; if the research doc records different names, edit the strings in this task accordingly.
+**Method names and field names** come from the research doc (Task 5). Per that doc, the gw-light listing of loved tracks is **not** a single call — there is no `favorite_song.getList` method. We do it in two stages:
+
+1. `song.getFavoriteIds` — body `{nb, start, checksum: null}`, no `user_id`, no `tab`. Returns `results.data` (array of `{SNG_ID, DATE_ADD}`) and `results.total`.
+2. `song.getListData` — body `{SNG_IDS: [<id>, ...]}`, batched in chunks of e.g. 200. Returns `results.data` (array of full song records with `SNG_ID, SNG_TITLE, ART_NAME, ALB_TITLE`).
+
+We merge the two by `SNG_ID` to produce `FavoriteSong` records that have both metadata and `DATE_ADD`. The two-call approach matches what `deezer-py.GW.get_my_favorite_tracks` and `deemix.GW.get_my_favorite_tracks` do.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1329,33 +1337,58 @@ import (
 )
 
 func TestListFavoriteSongs_Pagination(t *testing.T) {
-	var page atomic.Int32
+	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		method := r.URL.Query().Get("method")
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		start, _ := body["start"].(float64)
-
-		var data []map[string]any
-		switch int(start) {
-		case 0:
-			data = []map[string]any{
-				{"SNG_ID": "1", "SNG_TITLE": "A", "ART_NAME": "X", "ALB_TITLE": "Alb", "DATE_ADD": 1700000000},
-				{"SNG_ID": "2", "SNG_TITLE": "B", "ART_NAME": "Y", "ALB_TITLE": "Alb", "DATE_ADD": 1700000001},
-			}
-		case 2:
-			data = []map[string]any{
-				{"SNG_ID": "3", "SNG_TITLE": "C", "ART_NAME": "Z", "ALB_TITLE": "Alb", "DATE_ADD": 1700000002},
-			}
-		default:
-			data = []map[string]any{}
-		}
-		page.Add(1)
 		w.WriteHeader(200)
-		resp := map[string]any{
-			"error":   []any{},
-			"results": map[string]any{"data": data, "total": 3},
+
+		switch method {
+		case "song.getFavoriteIds":
+			start, _ := body["start"].(float64)
+			var data []map[string]any
+			switch int(start) {
+			case 0:
+				data = []map[string]any{
+					{"SNG_ID": "1", "DATE_ADD": 1700000000},
+					{"SNG_ID": "2", "DATE_ADD": 1700000001},
+				}
+			case 2:
+				data = []map[string]any{
+					{"SNG_ID": "3", "DATE_ADD": 1700000002},
+				}
+			default:
+				data = []map[string]any{}
+			}
+			resp := map[string]any{
+				"error":   []any{},
+				"results": map[string]any{"data": data, "total": 3},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		case "song.getListData":
+			ids, _ := body["SNG_IDS"].([]any)
+			data := make([]map[string]any, 0, len(ids))
+			titles := map[string]string{"1": "A", "2": "B", "3": "C"}
+			artists := map[string]string{"1": "X", "2": "Y", "3": "Z"}
+			for _, raw := range ids {
+				id, _ := raw.(string)
+				data = append(data, map[string]any{
+					"SNG_ID":    id,
+					"SNG_TITLE": titles[id],
+					"ART_NAME":  artists[id],
+					"ALB_TITLE": "Alb",
+				})
+			}
+			resp := map[string]any{
+				"error":   []any{},
+				"results": map[string]any{"data": data},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		default:
+			t.Errorf("unexpected method: %s", method)
 		}
-		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
 
@@ -1377,13 +1410,22 @@ func TestListFavoriteSongs_Pagination(t *testing.T) {
 	if songs[2].ID != "3" {
 		t.Errorf("third song id = %q", songs[2].ID)
 	}
-	if got := page.Load(); got < 2 {
-		t.Errorf("expected at least 2 pages fetched, got %d", got)
+	if songs[0].TimeAdd != 1700000000 {
+		t.Errorf("first song TimeAdd = %d, want 1700000000", songs[0].TimeAdd)
+	}
+	if got := calls.Load(); got < 3 {
+		// expect at least: 2 getFavoriteIds pages + 1 getListData enrichment
+		t.Errorf("expected at least 3 server calls, got %d", got)
 	}
 }
 
 func TestListFavoriteSongs_EmptyAccount(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Only song.getFavoriteIds is called when the account is empty;
+		// song.getListData should be skipped.
+		if r.URL.Query().Get("method") != "song.getFavoriteIds" {
+			t.Errorf("unexpected method on empty account: %s", r.URL.Query().Get("method"))
+		}
 		w.WriteHeader(200)
 		_, _ = fmt.Fprint(w, `{"error":[],"results":{"data":[],"total":0}}`)
 	}))
@@ -1422,60 +1464,125 @@ import (
 	"fmt"
 )
 
-// FavoriteSong is one entry in a user's loved-tracks library.
+// FavoriteSong is one entry in a user's loved-tracks library, after merging
+// IDs from song.getFavoriteIds with metadata from song.getListData.
 type FavoriteSong struct {
-	ID      string `json:"SNG_ID"`
-	Title   string `json:"SNG_TITLE"`
-	Artist  string `json:"ART_NAME"`
-	Album   string `json:"ALB_TITLE"`
-	TimeAdd int64  `json:"DATE_ADD"`
+	ID      string
+	Title   string
+	Artist  string
+	Album   string
+	TimeAdd int64
 }
 
-const listFavoriteSongsMethod = "favorite_song.getList"
+const (
+	listFavoriteIdsMethod  = "song.getFavoriteIds"
+	getSongListDataMethod  = "song.getListData"
+	enrichmentChunkSize    = 200
+)
+
+// favoriteIDRecord is the per-song record returned by song.getFavoriteIds.
+// Only SNG_ID and DATE_ADD are reliably present; the rest of the metadata
+// requires a follow-up song.getListData call.
+type favoriteIDRecord struct {
+	ID      string      `json:"SNG_ID"`
+	TimeAdd json.Number `json:"DATE_ADD"`
+}
+
+// songListDataRecord is the richer record returned by song.getListData.
+type songListDataRecord struct {
+	ID     string `json:"SNG_ID"`
+	Title  string `json:"SNG_TITLE"`
+	Artist string `json:"ART_NAME"`
+	Album  string `json:"ALB_TITLE"`
+}
 
 // ListFavoriteSongs returns every loved song in the authenticated user's
-// library, paginated by pageSize. CSRF acquisition and refresh are handled
-// by callWithCSRF.
+// library. It paginates song.getFavoriteIds by pageSize, then enriches the
+// results in chunks via song.getListData. CSRF acquisition and refresh are
+// handled by callWithCSRF.
 //
-// pageSize is the number of records requested per gateway call. Reasonable
-// values are 50–200; values too large risk the gateway returning errors
-// or truncating.
+// pageSize is the number of records requested per song.getFavoriteIds call.
+// Reasonable values are 100–10000 (deezer-py defaults to 10000, deemix to
+// 25; the gateway accepts up to at least 10000 in observed usage).
 func (c *Client) ListFavoriteSongs(ctx context.Context, pageSize int) ([]FavoriteSong, error) {
 	if pageSize <= 0 {
-		pageSize = 100
+		pageSize = 1000
 	}
 
 	if err := c.ensureCSRF(ctx); err != nil {
 		return nil, err
 	}
 
-	var all []FavoriteSong
+	// Stage 1: paginate song.getFavoriteIds to collect IDs + DATE_ADD.
+	var ids []favoriteIDRecord
 	start := 0
 	for {
 		body := map[string]any{
-			"user_id": c.userID,
-			"start":   start,
-			"nb":      pageSize,
-			"tab":     "loved",
+			"start":    start,
+			"nb":       pageSize,
+			"checksum": nil,
 		}
-		raw, err := c.callWithCSRF(ctx, listFavoriteSongsMethod, body)
+		raw, err := c.callWithCSRF(ctx, listFavoriteIdsMethod, body)
 		if err != nil {
-			return nil, fmt.Errorf("page start=%d: %w", start, err)
+			return nil, fmt.Errorf("getFavoriteIds start=%d: %w", start, err)
 		}
 		var page struct {
-			Data  []FavoriteSong `json:"data"`
-			Total int            `json:"total"`
+			Data  []favoriteIDRecord `json:"data"`
+			Total int                `json:"total"`
 		}
 		if err := json.Unmarshal(raw, &page); err != nil {
-			return nil, fmt.Errorf("decode page start=%d: %w", start, err)
+			return nil, fmt.Errorf("decode getFavoriteIds start=%d: %w", start, err)
 		}
 		if len(page.Data) == 0 {
 			break
 		}
-		all = append(all, page.Data...)
+		ids = append(ids, page.Data...)
 		start += len(page.Data)
 		if page.Total > 0 && start >= page.Total {
 			break
+		}
+	}
+
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	// Stage 2: enrich in chunks via song.getListData.
+	dateByID := make(map[string]int64, len(ids))
+	for _, r := range ids {
+		if t, err := r.TimeAdd.Int64(); err == nil {
+			dateByID[r.ID] = t
+		}
+	}
+
+	all := make([]FavoriteSong, 0, len(ids))
+	for i := 0; i < len(ids); i += enrichmentChunkSize {
+		end := i + enrichmentChunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := make([]string, 0, end-i)
+		for _, r := range ids[i:end] {
+			chunk = append(chunk, r.ID)
+		}
+		raw, err := c.callWithCSRF(ctx, getSongListDataMethod, map[string]any{"SNG_IDS": chunk})
+		if err != nil {
+			return nil, fmt.Errorf("getListData chunk %d-%d: %w", i, end, err)
+		}
+		var page struct {
+			Data []songListDataRecord `json:"data"`
+		}
+		if err := json.Unmarshal(raw, &page); err != nil {
+			return nil, fmt.Errorf("decode getListData chunk %d-%d: %w", i, end, err)
+		}
+		for _, rec := range page.Data {
+			all = append(all, FavoriteSong{
+				ID:      rec.ID,
+				Title:   rec.Title,
+				Artist:  rec.Artist,
+				Album:   rec.Album,
+				TimeAdd: dateByID[rec.ID],
+			})
 		}
 	}
 	return all, nil
@@ -2346,10 +2453,10 @@ func TestIntegration_ListFavoriteSongs_Live(t *testing.T) {
 		t.Fatalf("list one page: %v", err)
 	}
 
-	t.Logf("fetched %d songs (first page, max 50)", len(songs))
+	t.Logf("fetched %d song ids (first page, max 50)", len(songs))
 	for i, s := range songs {
-		if s.ID == "" || s.Title == "" {
-			t.Errorf("song %d has empty ID or Title: %+v", i, s)
+		if s.ID == "" {
+			t.Errorf("song %d has empty ID: %+v", i, s)
 		}
 	}
 }
@@ -2360,26 +2467,34 @@ func TestIntegration_ListFavoriteSongs_Live(t *testing.T) {
 Append to `internal/gateway/tracks.go` (`encoding/json` is already imported in this file):
 
 ```go
-// listFavoriteSongsOnePage fetches a single page. Used by the live integration
-// test so it doesn't have to walk the whole library.
+// listFavoriteSongsOnePage fetches a single page of loved-track IDs (no
+// metadata enrichment) via song.getFavoriteIds. Used by the live integration
+// test so it doesn't have to walk the whole library or do follow-up calls.
+// The returned FavoriteSong records have ID and TimeAdd populated; Title,
+// Artist, Album are empty (full enrichment is the caller's job in
+// ListFavoriteSongs).
 func (c *Client) listFavoriteSongsOnePage(ctx context.Context, start, nb int) ([]FavoriteSong, error) {
 	body := map[string]any{
-		"user_id": c.userID,
-		"start":   start,
-		"nb":      nb,
-		"tab":     "loved",
+		"start":    start,
+		"nb":       nb,
+		"checksum": nil,
 	}
-	raw, err := c.callWithCSRF(ctx, listFavoriteSongsMethod, body)
+	raw, err := c.callWithCSRF(ctx, listFavoriteIdsMethod, body)
 	if err != nil {
 		return nil, err
 	}
 	var page struct {
-		Data []FavoriteSong `json:"data"`
+		Data []favoriteIDRecord `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &page); err != nil {
 		return nil, err
 	}
-	return page.Data, nil
+	out := make([]FavoriteSong, 0, len(page.Data))
+	for _, r := range page.Data {
+		t, _ := r.TimeAdd.Int64()
+		out = append(out, FavoriteSong{ID: r.ID, TimeAdd: t})
+	}
+	return out, nil
 }
 ```
 
