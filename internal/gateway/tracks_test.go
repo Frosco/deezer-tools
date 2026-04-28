@@ -168,6 +168,48 @@ func TestListFavoriteSongs_PreservesIDsMissingFromEnrichment(t *testing.T) {
 	}
 }
 
+func TestListFavoriteSongs_AcceptsNumericSNG_ID(t *testing.T) {
+	// Real Deezer responses occasionally encode SNG_ID as a JSON number rather
+	// than a quoted string. Both shapes must decode without error and produce
+	// the same string ID downstream.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method := r.URL.Query().Get("method")
+		w.WriteHeader(200)
+		switch method {
+		case "song.getFavoriteIds":
+			_, _ = fmt.Fprint(w, `{"error":[],"results":{"data":[`+
+				`{"SNG_ID":"1","DATE_ADD":1700000000},`+
+				`{"SNG_ID":42,"DATE_ADD":1700000001}`+
+				`],"total":2}}`)
+		case "song.getListData":
+			_, _ = fmt.Fprint(w, `{"error":[],"results":{"data":[`+
+				`{"SNG_ID":1,"SNG_TITLE":"A","ART_NAME":"X","ALB_TITLE":"Alb"},`+
+				`{"SNG_ID":"42","SNG_TITLE":"B","ART_NAME":"Y","ALB_TITLE":"Alb"}`+
+				`]}}`)
+		}
+	}))
+	defer srv.Close()
+
+	c := New("arl")
+	c.baseURL = srv.URL
+	c.apiToken = "csrf"
+	c.userID = "42"
+
+	songs, err := c.ListFavoriteSongs(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("ListFavoriteSongs: %v", err)
+	}
+	if len(songs) != 2 {
+		t.Fatalf("got %d songs, want 2", len(songs))
+	}
+	if songs[0].ID != "1" || songs[1].ID != "42" {
+		t.Errorf("IDs = [%q, %q], want [\"1\", \"42\"]", songs[0].ID, songs[1].ID)
+	}
+	if songs[0].Title != "A" || songs[1].Title != "B" {
+		t.Errorf("Titles = [%q, %q]", songs[0].Title, songs[1].Title)
+	}
+}
+
 func TestRemoveFavoriteSong_SendsCorrectBody(t *testing.T) {
 	var got map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

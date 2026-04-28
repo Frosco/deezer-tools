@@ -22,20 +22,40 @@ const (
 	enrichmentChunkSize   = 200
 )
 
+// flexString is a string that unmarshals from either a JSON string or a JSON
+// number. The gw-light gateway returns SNG_ID inconsistently — sometimes
+// quoted ("12345"), sometimes a bare number (12345) — within a single
+// response. Applying this only to SNG_ID; we leave it off TimeAdd because
+// json.Number already handles both forms there.
+type flexString string
+
+func (s *flexString) UnmarshalJSON(b []byte) error {
+	if len(b) > 0 && b[0] == '"' {
+		var str string
+		if err := json.Unmarshal(b, &str); err != nil {
+			return err
+		}
+		*s = flexString(str)
+		return nil
+	}
+	*s = flexString(b)
+	return nil
+}
+
 // favoriteIDRecord is the per-song record returned by song.getFavoriteIds.
 // Only SNG_ID and DATE_ADD are reliably present; the rest of the metadata
 // requires a follow-up song.getListData call.
 type favoriteIDRecord struct {
-	ID      string      `json:"SNG_ID"`
+	ID      flexString  `json:"SNG_ID"`
 	TimeAdd json.Number `json:"DATE_ADD"`
 }
 
 // songListDataRecord is the richer record returned by song.getListData.
 type songListDataRecord struct {
-	ID     string `json:"SNG_ID"`
-	Title  string `json:"SNG_TITLE"`
-	Artist string `json:"ART_NAME"`
-	Album  string `json:"ALB_TITLE"`
+	ID     flexString `json:"SNG_ID"`
+	Title  string     `json:"SNG_TITLE"`
+	Artist string     `json:"ART_NAME"`
+	Album  string     `json:"ALB_TITLE"`
 }
 
 // ListFavoriteSongs returns every loved song in the authenticated user's
@@ -97,7 +117,7 @@ func (c *Client) ListFavoriteSongs(ctx context.Context, pageSize int) ([]Favorit
 	dateByID := make(map[string]int64, len(ids))
 	for _, r := range ids {
 		if t, err := r.TimeAdd.Int64(); err == nil {
-			dateByID[r.ID] = t
+			dateByID[string(r.ID)] = t
 		}
 	}
 
@@ -109,7 +129,7 @@ func (c *Client) ListFavoriteSongs(ctx context.Context, pageSize int) ([]Favorit
 		}
 		chunk := make([]string, 0, end-i)
 		for _, r := range ids[i:end] {
-			chunk = append(chunk, r.ID)
+			chunk = append(chunk, string(r.ID))
 		}
 		raw, err := c.callWithCSRF(ctx, getSongListDataMethod, map[string]any{"SNG_IDS": chunk})
 		if err != nil {
@@ -122,19 +142,19 @@ func (c *Client) ListFavoriteSongs(ctx context.Context, pageSize int) ([]Favorit
 			return nil, fmt.Errorf("decode getListData chunk %d-%d: %w", i, end, err)
 		}
 		for _, rec := range page.Data {
-			metaByID[rec.ID] = rec
+			metaByID[string(rec.ID)] = rec
 		}
 	}
 
 	all := make([]FavoriteSong, 0, len(ids))
 	for _, r := range ids {
-		meta := metaByID[r.ID]
+		meta := metaByID[string(r.ID)]
 		all = append(all, FavoriteSong{
-			ID:      r.ID,
+			ID:      string(r.ID),
 			Title:   meta.Title,
 			Artist:  meta.Artist,
 			Album:   meta.Album,
-			TimeAdd: dateByID[r.ID],
+			TimeAdd: dateByID[string(r.ID)],
 		})
 	}
 	return all, nil
@@ -178,7 +198,7 @@ func (c *Client) listFavoriteSongsOnePage(ctx context.Context, start, nb int) ([
 	out := make([]FavoriteSong, 0, len(page.Data))
 	for _, r := range page.Data {
 		t, _ := r.TimeAdd.Int64()
-		out = append(out, FavoriteSong{ID: r.ID, TimeAdd: t})
+		out = append(out, FavoriteSong{ID: string(r.ID), TimeAdd: t})
 	}
 	return out, nil
 }
