@@ -89,7 +89,11 @@ func (c *Client) ListFavoriteSongs(ctx context.Context, pageSize int) ([]Favorit
 		return nil, nil
 	}
 
-	// Stage 2: enrich in chunks via song.getListData.
+	// Stage 2: enrich in chunks via song.getListData. The IDs from Stage 1
+	// are authoritative for "what is loved"; Stage 2 only adds metadata.
+	// If getListData omits an ID (deleted track, regional restriction, etc.)
+	// we still emit a FavoriteSong for it — otherwise the wipe would silently
+	// skip those tracks.
 	dateByID := make(map[string]int64, len(ids))
 	for _, r := range ids {
 		if t, err := r.TimeAdd.Int64(); err == nil {
@@ -97,7 +101,7 @@ func (c *Client) ListFavoriteSongs(ctx context.Context, pageSize int) ([]Favorit
 		}
 	}
 
-	all := make([]FavoriteSong, 0, len(ids))
+	metaByID := make(map[string]songListDataRecord, len(ids))
 	for i := 0; i < len(ids); i += enrichmentChunkSize {
 		end := i + enrichmentChunkSize
 		if end > len(ids) {
@@ -118,14 +122,20 @@ func (c *Client) ListFavoriteSongs(ctx context.Context, pageSize int) ([]Favorit
 			return nil, fmt.Errorf("decode getListData chunk %d-%d: %w", i, end, err)
 		}
 		for _, rec := range page.Data {
-			all = append(all, FavoriteSong{
-				ID:      rec.ID,
-				Title:   rec.Title,
-				Artist:  rec.Artist,
-				Album:   rec.Album,
-				TimeAdd: dateByID[rec.ID],
-			})
+			metaByID[rec.ID] = rec
 		}
+	}
+
+	all := make([]FavoriteSong, 0, len(ids))
+	for _, r := range ids {
+		meta := metaByID[r.ID]
+		all = append(all, FavoriteSong{
+			ID:      r.ID,
+			Title:   meta.Title,
+			Artist:  meta.Artist,
+			Album:   meta.Album,
+			TimeAdd: dateByID[r.ID],
+		})
 	}
 	return all, nil
 }

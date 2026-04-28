@@ -118,3 +118,52 @@ func TestListFavoriteSongs_EmptyAccount(t *testing.T) {
 		t.Errorf("got %d, want 0", len(songs))
 	}
 }
+
+func TestListFavoriteSongs_PreservesIDsMissingFromEnrichment(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method := r.URL.Query().Get("method")
+		w.WriteHeader(200)
+		switch method {
+		case "song.getFavoriteIds":
+			_, _ = fmt.Fprint(w, `{"error":[],"results":{"data":[`+
+				`{"SNG_ID":"1","DATE_ADD":1700000000},`+
+				`{"SNG_ID":"2","DATE_ADD":1700000001},`+
+				`{"SNG_ID":"3","DATE_ADD":1700000002}`+
+				`],"total":3}}`)
+		case "song.getListData":
+			// Server only returns metadata for IDs 1 and 3 — ID 2 is dropped
+			// (e.g. removed track). The orchestration must still see ID 2
+			// in the result so the wipe can delete it.
+			_, _ = fmt.Fprint(w, `{"error":[],"results":{"data":[`+
+				`{"SNG_ID":"1","SNG_TITLE":"A","ART_NAME":"X","ALB_TITLE":"Alb"},`+
+				`{"SNG_ID":"3","SNG_TITLE":"C","ART_NAME":"Z","ALB_TITLE":"Alb"}`+
+				`]}}`)
+		}
+	}))
+	defer srv.Close()
+
+	c := New("arl")
+	c.baseURL = srv.URL
+	c.apiToken = "csrf"
+	c.userID = "42"
+
+	songs, err := c.ListFavoriteSongs(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("ListFavoriteSongs: %v", err)
+	}
+	if len(songs) != 3 {
+		t.Fatalf("got %d songs, want 3 (all IDs preserved even when enrichment drops some)", len(songs))
+	}
+	if songs[0].ID != "1" || songs[1].ID != "2" || songs[2].ID != "3" {
+		t.Errorf("ID order = [%s, %s, %s], want [1, 2, 3]", songs[0].ID, songs[1].ID, songs[2].ID)
+	}
+	if songs[1].Title != "" || songs[1].Artist != "" {
+		t.Errorf("expected empty metadata for un-enriched ID 2, got %+v", songs[1])
+	}
+	if songs[1].TimeAdd != 1700000001 {
+		t.Errorf("ID 2 TimeAdd = %d, want 1700000001 (must come from getFavoriteIds)", songs[1].TimeAdd)
+	}
+	if songs[0].Title != "A" || songs[2].Title != "C" {
+		t.Errorf("enriched titles wrong: [%q, %q]", songs[0].Title, songs[2].Title)
+	}
+}
