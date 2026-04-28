@@ -113,6 +113,15 @@ func Wipe(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 	defer skipLog.Close()
 
 	for i, s := range songs {
+		// Honor Ctrl-C even between successful deletes — the inner backoff
+		// only checks ctx during sleeps, so a 10k-track happy-path loop would
+		// otherwise ignore SIGINT until the next failure.
+		select {
+		case <-ctx.Done():
+			res.Elapsed = time.Since(start)
+			return res, ctx.Err()
+		default:
+		}
 		if err := deleteWithRetry(ctx, gw, s.ID); err != nil {
 			var gerr *gateway.GatewayError
 			if errors.As(err, &gerr) && gerr.Kind == gateway.ErrAuthFailed {
