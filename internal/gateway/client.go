@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"time"
 )
@@ -26,11 +27,21 @@ type Client struct {
 
 // New constructs a Client authenticated with the given arl cookie value.
 // CSRF acquisition is the caller's responsibility (see ensureCSRF).
+//
+// The client owns a cookie jar so server-set session cookies (notably "sid",
+// which the gw-light gateway uses to bind CSRF tokens to a session) persist
+// across calls. Without this, deezer.getUserData hands out a CSRF token tied
+// to a session we'd immediately drop, and the next call fails with
+// "Invalid CSRF token".
 func New(arl string) *Client {
+	jar, _ := cookiejar.New(nil)
 	return &Client{
-		httpClient: &http.Client{Timeout: 30 * time.Second},
-		arl:        arl,
-		baseURL:    defaultBaseURL,
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+			Jar:     jar,
+		},
+		arl:     arl,
+		baseURL: defaultBaseURL,
 	}
 }
 
