@@ -139,3 +139,16 @@ func (c *Client) ListFavoriteSongs(ctx context.Context, pageSize int) ([]Favorit
 	}
 	return all, nil
 }
+
+const removeFavoriteSongMethod = "favorite_song.remove"
+
+// RemoveFavoriteSong unloves the song with the given Deezer SNG_ID.
+// CSRF acquisition and refresh-on-expiry are handled by callWithCSRF.
+// Returns *GatewayError on classified failure, error otherwise.
+func (c *Client) RemoveFavoriteSong(ctx context.Context, songID string) error {
+	body := map[string]any{"SNG_ID": songID}
+	if _, err := c.callWithCSRF(ctx, removeFavoriteSongMethod, body); err != nil {
+		return err
+	}
+	return nil
+}

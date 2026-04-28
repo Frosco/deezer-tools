@@ -167,3 +167,66 @@ func TestListFavoriteSongs_PreservesIDsMissingFromEnrichment(t *testing.T) {
 		t.Errorf("enriched titles wrong: [%q, %q]", songs[0].Title, songs[2].Title)
 	}
 }
+
+func TestRemoveFavoriteSong_SendsCorrectBody(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		if r.URL.Query().Get("method") != "favorite_song.remove" {
+			t.Errorf("method = %q", r.URL.Query().Get("method"))
+		}
+		w.WriteHeader(200)
+		_, _ = fmt.Fprint(w, `{"error":[],"results":true}`)
+	}))
+	defer srv.Close()
+
+	c := New("arl")
+	c.baseURL = srv.URL
+	c.apiToken = "csrf"
+	c.userID = "42"
+
+	if err := c.RemoveFavoriteSong(context.Background(), "12345"); err != nil {
+		t.Fatalf("RemoveFavoriteSong: %v", err)
+	}
+	if got["SNG_ID"] != "12345" {
+		t.Errorf("body SNG_ID = %v, want 12345", got["SNG_ID"])
+	}
+}
+
+func TestRemoveFavoriteSong_PropagatesAuthError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = fmt.Fprint(w, `{"error":{"GATEWAY_ERROR":"NEED_USER_AUTH_REQUIRED"}}`)
+	}))
+	defer srv.Close()
+
+	c := New("arl")
+	c.baseURL = srv.URL
+	c.apiToken = "csrf"
+	c.userID = "42"
+
+	err := c.RemoveFavoriteSong(context.Background(), "1")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var gerr *GatewayError
+	if !errorsAs(err, &gerr) || gerr.Kind != ErrAuthFailed {
+		t.Errorf("err = %+v, want ErrAuthFailed", err)
+	}
+}
+
+func errorsAs(err error, target **GatewayError) bool {
+	for err != nil {
+		if g, ok := err.(*GatewayError); ok {
+			*target = g
+			return true
+		}
+		type unwrapper interface{ Unwrap() error }
+		u, ok := err.(unwrapper)
+		if !ok {
+			return false
+		}
+		err = u.Unwrap()
+	}
+	return false
+}
