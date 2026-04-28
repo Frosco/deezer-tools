@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,24 +36,14 @@ func newWipeCmd() *cobra.Command {
 
 			client := gateway.New(cfg.ARL)
 
-			res, err := lovedtracks.Wipe(cmd.Context(), client, lovedtracks.Options{
+			_, err = lovedtracks.Wipe(cmd.Context(), client, lovedtracks.Options{
 				DryRun:    dryRun,
 				BackupDir: backupDir,
 				Stdin:     cmd.InOrStdin(),
 				Stdout:    cmd.OutOrStdout(),
 				Stderr:    cmd.ErrOrStderr(),
 			})
-			if err != nil {
-				if errors.Is(err, lovedtracks.ErrAborted) {
-					return err
-				}
-				if res != nil && res.SkippedCount > 0 {
-					// non-zero exit but already-printed summary is fine
-					return err
-				}
-				return err
-			}
-			return nil
+			return err
 		},
 	}
 
