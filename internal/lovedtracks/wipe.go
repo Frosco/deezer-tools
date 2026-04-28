@@ -121,7 +121,9 @@ func Wipe(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 			}
 			res.SkippedCount++
 			res.SkipLogPath = skipPath
-			_ = writeSkipEntry(skipLog, s, err)
+			if werr := writeSkipEntry(skipLog, s, err); werr != nil {
+				fmt.Fprintf(opts.Stderr, "warning: failed to record skip for track %s in %s: %v\n", s.ID, skipPath, werr)
+			}
 			continue
 		}
 		res.DeletedCount++
