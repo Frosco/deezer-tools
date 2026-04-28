@@ -1,0 +1,131 @@
+package gateway
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+)
+
+// FavoriteSong is one entry in a user's loved-tracks library, after merging
+// IDs from song.getFavoriteIds with metadata from song.getListData.
+type FavoriteSong struct {
+	ID      string
+	Title   string
+	Artist  string
+	Album   string
+	TimeAdd int64
+}
+
+const (
+	listFavoriteIdsMethod = "song.getFavoriteIds"
+	getSongListDataMethod = "song.getListData"
+	enrichmentChunkSize   = 200
+)
+
+// favoriteIDRecord is the per-song record returned by song.getFavoriteIds.
+// Only SNG_ID and DATE_ADD are reliably present; the rest of the metadata
+// requires a follow-up song.getListData call.
+type favoriteIDRecord struct {
+	ID      string      `json:"SNG_ID"`
+	TimeAdd json.Number `json:"DATE_ADD"`
+}
+
+// songListDataRecord is the richer record returned by song.getListData.
+type songListDataRecord struct {
+	ID     string `json:"SNG_ID"`
+	Title  string `json:"SNG_TITLE"`
+	Artist string `json:"ART_NAME"`
+	Album  string `json:"ALB_TITLE"`
+}
+
+// ListFavoriteSongs returns every loved song in the authenticated user's
+// library. It paginates song.getFavoriteIds by pageSize, then enriches the
+// results in chunks via song.getListData. CSRF acquisition and refresh are
+// handled by callWithCSRF.
+//
+// pageSize is the number of records requested per song.getFavoriteIds call.
+// Reasonable values are 100–10000 (deezer-py defaults to 10000, deemix to
+// 25; the gateway accepts up to at least 10000 in observed usage).
+func (c *Client) ListFavoriteSongs(ctx context.Context, pageSize int) ([]FavoriteSong, error) {
+	if pageSize <= 0 {
+		pageSize = 1000
+	}
+
+	if err := c.ensureCSRF(ctx); err != nil {
+		return nil, err
+	}
+
+	// Stage 1: paginate song.getFavoriteIds to collect IDs + DATE_ADD.
+	var ids []favoriteIDRecord
+	start := 0
+	for {
+		body := map[string]any{
+			"start":    start,
+			"nb":       pageSize,
+			"checksum": nil,
+		}
+		raw, err := c.callWithCSRF(ctx, listFavoriteIdsMethod, body)
+		if err != nil {
+			return nil, fmt.Errorf("getFavoriteIds start=%d: %w", start, err)
+		}
+		var page struct {
+			Data  []favoriteIDRecord `json:"data"`
+			Total int                `json:"total"`
+		}
+		if err := json.Unmarshal(raw, &page); err != nil {
+			return nil, fmt.Errorf("decode getFavoriteIds start=%d: %w", start, err)
+		}
+		if len(page.Data) == 0 {
+			break
+		}
+		ids = append(ids, page.Data...)
+		start += len(page.Data)
+		if page.Total > 0 && start >= page.Total {
+			break
+		}
+	}
+
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	// Stage 2: enrich in chunks via song.getListData.
+	dateByID := make(map[string]int64, len(ids))
+	for _, r := range ids {
+		if t, err := r.TimeAdd.Int64(); err == nil {
+			dateByID[r.ID] = t
+		}
+	}
+
+	all := make([]FavoriteSong, 0, len(ids))
+	for i := 0; i < len(ids); i += enrichmentChunkSize {
+		end := i + enrichmentChunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := make([]string, 0, end-i)
+		for _, r := range ids[i:end] {
+			chunk = append(chunk, r.ID)
+		}
+		raw, err := c.callWithCSRF(ctx, getSongListDataMethod, map[string]any{"SNG_IDS": chunk})
+		if err != nil {
+			return nil, fmt.Errorf("getListData chunk %d-%d: %w", i, end, err)
+		}
+		var page struct {
+			Data []songListDataRecord `json:"data"`
+		}
+		if err := json.Unmarshal(raw, &page); err != nil {
+			return nil, fmt.Errorf("decode getListData chunk %d-%d: %w", i, end, err)
+		}
+		for _, rec := range page.Data {
+			all = append(all, FavoriteSong{
+				ID:      rec.ID,
+				Title:   rec.Title,
+				Artist:  rec.Artist,
+				Album:   rec.Album,
+				TimeAdd: dateByID[rec.ID],
+			})
+		}
+	}
+	return all, nil
+}
