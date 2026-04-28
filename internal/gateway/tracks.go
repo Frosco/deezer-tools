@@ -152,3 +152,33 @@ func (c *Client) RemoveFavoriteSong(ctx context.Context, songID string) error {
 	}
 	return nil
 }
+
+// listFavoriteSongsOnePage fetches a single page of loved-track IDs (no
+// metadata enrichment) via song.getFavoriteIds. Used by the live integration
+// test so it doesn't have to walk the whole library or do follow-up calls.
+// The returned FavoriteSong records have ID and TimeAdd populated; Title,
+// Artist, Album are empty (full enrichment is the caller's job in
+// ListFavoriteSongs).
+func (c *Client) listFavoriteSongsOnePage(ctx context.Context, start, nb int) ([]FavoriteSong, error) {
+	body := map[string]any{
+		"start":    start,
+		"nb":       nb,
+		"checksum": nil,
+	}
+	raw, err := c.callWithCSRF(ctx, listFavoriteIdsMethod, body)
+	if err != nil {
+		return nil, err
+	}
+	var page struct {
+		Data []favoriteIDRecord `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &page); err != nil {
+		return nil, err
+	}
+	out := make([]FavoriteSong, 0, len(page.Data))
+	for _, r := range page.Data {
+		t, _ := r.TimeAdd.Int64()
+		out = append(out, FavoriteSong{ID: r.ID, TimeAdd: t})
+	}
+	return out, nil
+}
