@@ -13,6 +13,10 @@ var rootCmd = &cobra.Command{
 	Long:  `deezer-tools is a CLI for managing a personal Deezer account: loved content, playlists, and more.`,
 }
 
+func init() {
+	rootCmd.AddCommand(newLovedTracksCmd())
+}
+
 func main() {
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
