@@ -13,3 +13,6 @@ deezer-loved-tracks-*.skip.log
 
 # Local config (never commit secrets)
 config.toml
+
+# Override global ~/.config/git/ignore for project docs we DO want tracked.
+!CLAUDE.md
