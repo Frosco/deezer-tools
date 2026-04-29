@@ -62,6 +62,7 @@ Backups (`deezer-loved-tracks-*.json`) and skip logs (`*.skip.log`) are gitignor
 
 - `docs/superpowers/specs/` — design specs that predate the implementation. The wipe-loved-tracks design doc explains why list/backup/confirm/delete are separate phases and the empty-account edge case.
 - `docs/superpowers/plans/` — phased implementation plans.
+- `docs/solutions/` — documented solutions to past problems (bugs, best practices, workflow patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`). Relevant when implementing or debugging in documented areas.
 - Reverse-engineered gw-light protocol notes are referenced from the `internal/gateway` package doc.
 
 When adding a new domain (loved albums, playlists, etc.), mirror the `lovedtracks` shape: a small package that depends on `internal/gateway` via a narrow interface, owns its own CLI subcommand under `cmd/deezer-tools`, and does not cross-import other domain packages.

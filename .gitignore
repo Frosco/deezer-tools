@@ -16,3 +16,4 @@ config.toml
 
 # Override global ~/.config/git/ignore for project docs we DO want tracked.
 !CLAUDE.md
+!docs/solutions/
