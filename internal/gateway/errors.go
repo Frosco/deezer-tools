@@ -112,6 +112,12 @@ func classifyError(method string, status int, body []byte) *GatewayError {
 			}
 		case "DATA_ERROR":
 			return &GatewayError{Kind: ErrNotFound, Method: method, Status: status, Message: msg}
+		case "QUOTA_ERROR":
+			// gw-light's own throttle signal, returned at HTTP 200. Treat as
+			// rate-limit so deleteWithRetry backs off instead of streaming
+			// failures (see 2026-04-28 incident: 5,513 unretried QUOTA_ERROR
+			// responses tripped Akamai's WAF and IP-blocked us).
+			return &GatewayError{Kind: ErrRateLimited, Method: method, Status: status, Message: "QUOTA_ERROR: " + msg}
 		}
 	}
 

@@ -46,6 +46,17 @@ func TestClassifyError_RateLimit429(t *testing.T) {
 	}
 }
 
+// QUOTA_ERROR is the gw-light protocol's own throttle signal — it arrives at
+// HTTP 200 with a JSON body. Treating it as ErrUnknown caused the run on
+// 2026-04-28 to skip 5,513 tracks at full rate and trigger an Akamai IP block.
+func TestClassifyError_QuotaErrorIsRateLimited(t *testing.T) {
+	body := []byte(`{"error":{"QUOTA_ERROR":"Quota exceeded on playlist delete songs"}}`)
+	err := classifyError("favorite_song.remove", 200, body)
+	if err == nil || err.Kind != ErrRateLimited {
+		t.Errorf("got %+v, want ErrRateLimited", err)
+	}
+}
+
 func TestClassifyError_ServerError5xx(t *testing.T) {
 	for _, status := range []int{500, 502, 503, 504} {
 		err := classifyError("favorite_song.remove", status, nil)

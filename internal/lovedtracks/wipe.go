@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +22,24 @@ import (
 
 // ErrAborted is returned when the user fails to confirm the wipe.
 var ErrAborted = errors.New("wipe aborted by user")
+
+// defaultRetryBackoff is the per-retry sleep schedule for ErrRateLimited /
+// ErrServerError responses on a single track. Total ~232s of waiting before
+// a track is given up on. Long enough to cross most short quota windows
+// without amplifying load when one window is genuinely exhausted.
+var defaultRetryBackoff = []time.Duration{
+	5 * time.Second,
+	15 * time.Second,
+	30 * time.Second,
+	60 * time.Second,
+	120 * time.Second,
+}
+
+const (
+	defaultPace                  = time.Second
+	defaultPaceJitter            = 200 * time.Millisecond
+	defaultMaxConsecutiveFailure = 5
+)
 
 // Gateway is the slice of internal/gateway.Client used by Wipe.
 type Gateway interface {
@@ -36,6 +55,28 @@ type Options struct {
 	Stdin     io.Reader
 	Stdout    io.Writer
 	Stderr    io.Writer
+
+	// Pace is the minimum delay before each delete attempt. Zero or unset
+	// uses the default (1s). Negative disables pacing entirely (test only).
+	// Pacing exists so that even on the happy path we don't stream requests
+	// fast enough to look like a bot — which is what tripped Akamai on
+	// 2026-04-28.
+	Pace time.Duration
+
+	// PaceJitter is the random extra delay [0, PaceJitter] added per request.
+	// Zero or unset uses the default (200ms). Ignored when Pace <= 0.
+	PaceJitter time.Duration
+
+	// RetryBackoff is the per-retry sleep schedule for ErrRateLimited /
+	// ErrServerError on a single track. Nil uses the default schedule. An
+	// empty slice disables retries (initial attempt only).
+	RetryBackoff []time.Duration
+
+	// MaxConsecutiveFinalFailures aborts the run if this many tracks fail
+	// in a row (after their retry budgets are exhausted) with no successful
+	// delete in between. Zero or unset uses the default (5). Negative
+	// disables the breaker (test only).
+	MaxConsecutiveFinalFailures int
 }
 
 // Result summarizes a completed Wipe run.
@@ -70,6 +111,23 @@ func Wipe(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 	}
 	if opts.BackupDir == "" {
 		opts.BackupDir = "."
+	}
+
+	pace := opts.Pace
+	if pace == 0 {
+		pace = defaultPace
+	}
+	jitter := opts.PaceJitter
+	if jitter == 0 {
+		jitter = defaultPaceJitter
+	}
+	retryBackoff := opts.RetryBackoff
+	if retryBackoff == nil {
+		retryBackoff = defaultRetryBackoff
+	}
+	maxConsec := opts.MaxConsecutiveFinalFailures
+	if maxConsec == 0 {
+		maxConsec = defaultMaxConsecutiveFailure
 	}
 
 	start := time.Now()
@@ -112,6 +170,7 @@ func Wipe(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 	}
 	defer skipLog.Close()
 
+	consecutiveFailures := 0
 	for i, s := range songs {
 		// Honor Ctrl-C even between successful deletes — the inner backoff
 		// only checks ctx during sleeps, so a 10k-track happy-path loop would
@@ -122,7 +181,17 @@ func Wipe(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 			return res, ctx.Err()
 		default:
 		}
-		if err := deleteWithRetry(ctx, gw, s.ID); err != nil {
+
+		if err := pacedSleep(ctx, pace, jitter); err != nil {
+			res.Elapsed = time.Since(start)
+			return res, err
+		}
+
+		if err := deleteWithRetry(ctx, gw, s.ID, retryBackoff); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				res.Elapsed = time.Since(start)
+				return res, err
+			}
 			var gerr *gateway.GatewayError
 			if errors.As(err, &gerr) && gerr.Kind == gateway.ErrAuthFailed {
 				res.Elapsed = time.Since(start)
@@ -133,9 +202,15 @@ func Wipe(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 			if werr := writeSkipEntry(skipLog, s, err); werr != nil {
 				fmt.Fprintf(opts.Stderr, "warning: failed to record skip for track %s in %s: %v\n", s.ID, skipPath, werr)
 			}
+			consecutiveFailures++
+			if maxConsec > 0 && consecutiveFailures >= maxConsec {
+				res.Elapsed = time.Since(start)
+				return res, fmt.Errorf("aborting wipe: %d consecutive deletes failed (quota likely tripped or service degraded). Try again later. Skipped tracks recorded in %s", consecutiveFailures, skipPath)
+			}
 			continue
 		}
 		res.DeletedCount++
+		consecutiveFailures = 0
 		if (i+1)%50 == 0 || i+1 == len(songs) {
 			fmt.Fprintf(opts.Stderr, "deleted %d/%d\n", i+1, len(songs))
 		}
@@ -224,36 +299,55 @@ func writeSkipEntry(w io.Writer, s gateway.FavoriteSong, err error) error {
 	return werr
 }
 
-func deleteWithRetry(ctx context.Context, gw Gateway, songID string) error {
+// pacedSleep waits pace + rand[0, jitter) before returning, honoring ctx.
+// pace <= 0 disables the wait entirely. Jitter <= 0 just sleeps pace.
+func pacedSleep(ctx context.Context, pace, jitter time.Duration) error {
+	if pace <= 0 {
+		return nil
+	}
+	d := pace
+	if jitter > 0 {
+		d += time.Duration(rand.Int64N(int64(jitter)))
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
+}
+
+func deleteWithRetry(ctx context.Context, gw Gateway, songID string, retryBackoff []time.Duration) error {
 	// CSRF refresh is handled inside the gateway client (callWithCSRF), so
-	// this layer only retries on transient transport failures (rate limit /
-	// 5xx). Auth failures and per-track 4xx errors return immediately and
-	// are handled by the caller.
-	backoff := []time.Duration{0, time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}
-	var lastErr error
-	for _, d := range backoff {
-		if d > 0 {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(d):
-			}
+	// this layer only retries on transient transport failures: ErrRateLimited
+	// (incl. QUOTA_ERROR mapped from gw-light) and ErrServerError. Auth
+	// failures and per-track 4xx errors return immediately and are handled
+	// by the caller.
+	err := gw.RemoveFavoriteSong(ctx, songID)
+	if err == nil {
+		return nil
+	}
+	for _, d := range retryBackoff {
+		if !shouldRetry(err) {
+			return err
 		}
-		err := gw.RemoveFavoriteSong(ctx, songID)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(d):
+		}
+		err = gw.RemoveFavoriteSong(ctx, songID)
 		if err == nil {
 			return nil
 		}
-		lastErr = err
-		var gerr *gateway.GatewayError
-		if errors.As(err, &gerr) {
-			switch gerr.Kind {
-			case gateway.ErrRateLimited, gateway.ErrServerError:
-				continue
-			default:
-				return err
-			}
-		}
-		return err
 	}
-	return lastErr
+	return err
+}
+
+func shouldRetry(err error) bool {
+	var gerr *gateway.GatewayError
+	if !errors.As(err, &gerr) {
+		return false
+	}
+	return gerr.Kind == gateway.ErrRateLimited || gerr.Kind == gateway.ErrServerError
 }

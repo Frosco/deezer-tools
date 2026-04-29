@@ -10,16 +10,18 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/niref/deezer-tools/internal/gateway"
 )
 
 type fakeGateway struct {
-	songs            []gateway.FavoriteSong
-	listErr          error
-	removeErrByID    map[string]error
-	removed          []string
-	removeCallCount  int
+	songs           []gateway.FavoriteSong
+	listErr         error
+	removeErrByID   map[string]error
+	removeFn        func(ctx context.Context, id string) error
+	removed         []string
+	removeCallCount int
 }
 
 func (f *fakeGateway) ListFavoriteSongs(_ context.Context, _ int) ([]gateway.FavoriteSong, error) {
@@ -29,13 +31,39 @@ func (f *fakeGateway) ListFavoriteSongs(_ context.Context, _ int) ([]gateway.Fav
 	return f.songs, nil
 }
 
-func (f *fakeGateway) RemoveFavoriteSong(_ context.Context, id string) error {
+func (f *fakeGateway) RemoveFavoriteSong(ctx context.Context, id string) error {
 	f.removeCallCount++
+	if f.removeFn != nil {
+		err := f.removeFn(ctx, id)
+		if err == nil {
+			f.removed = append(f.removed, id)
+		}
+		return err
+	}
 	if err, ok := f.removeErrByID[id]; ok {
 		return err
 	}
 	f.removed = append(f.removed, id)
 	return nil
+}
+
+// fastTune disables pacing/retry/breaker so unit tests don't sleep. Tests
+// override the defaults explicitly; the CLI sets production values.
+func fastTune(o Options) Options {
+	o.Pace = -1
+	o.PaceJitter = -1
+	o.RetryBackoff = []time.Duration{}
+	o.MaxConsecutiveFinalFailures = -1
+	return o
+}
+
+func quotaErr() error {
+	return &gateway.GatewayError{
+		Kind:    gateway.ErrRateLimited,
+		Method:  "favorite_song.remove",
+		Status:  200,
+		Message: "QUOTA_ERROR: Quota exceeded on playlist delete songs",
+	}
 }
 
 func makeSongs(n int) []gateway.FavoriteSong {
@@ -67,9 +95,9 @@ func TestWipe_EmptyAccount(t *testing.T) {
 	fg := &fakeGateway{songs: nil}
 	out := &bytes.Buffer{}
 
-	res, err := Wipe(context.Background(), fg, Options{
+	res, err := Wipe(context.Background(), fg, fastTune(Options{
 		BackupDir: dir, Stdout: out, Stderr: io.Discard, Stdin: strings.NewReader(""),
-	})
+	}))
 	if err != nil {
 		t.Fatalf("Wipe: %v", err)
 	}
@@ -93,9 +121,9 @@ func TestWipe_DryRun(t *testing.T) {
 	fg := &fakeGateway{songs: makeSongs(5)}
 	out := &bytes.Buffer{}
 
-	res, err := Wipe(context.Background(), fg, Options{
+	res, err := Wipe(context.Background(), fg, fastTune(Options{
 		DryRun: true, BackupDir: dir, Stdout: out, Stderr: io.Discard, Stdin: strings.NewReader(""),
-	})
+	}))
 	if err != nil {
 		t.Fatalf("Wipe: %v", err)
 	}
@@ -120,9 +148,9 @@ func TestWipe_ConfirmationWrongCountAborts(t *testing.T) {
 	fg := &fakeGateway{songs: makeSongs(3)}
 	out := &bytes.Buffer{}
 
-	_, err := Wipe(context.Background(), fg, Options{
+	_, err := Wipe(context.Background(), fg, fastTune(Options{
 		BackupDir: dir, Stdout: out, Stderr: io.Discard, Stdin: strings.NewReader("yes\n"),
-	})
+	}))
 	if err == nil || !errors.Is(err, ErrAborted) {
 		t.Errorf("err = %v, want ErrAborted", err)
 	}
@@ -136,9 +164,9 @@ func TestWipe_HappyPath(t *testing.T) {
 	fg := &fakeGateway{songs: makeSongs(3)}
 	out := &bytes.Buffer{}
 
-	res, err := Wipe(context.Background(), fg, Options{
+	res, err := Wipe(context.Background(), fg, fastTune(Options{
 		BackupDir: dir, Stdout: out, Stderr: io.Discard, Stdin: strings.NewReader("3\n"),
-	})
+	}))
 	if err != nil {
 		t.Fatalf("Wipe: %v", err)
 	}
@@ -160,9 +188,9 @@ func TestWipe_SkipOn4xxContinues(t *testing.T) {
 	}
 	out := &bytes.Buffer{}
 
-	res, err := Wipe(context.Background(), fg, Options{
+	res, err := Wipe(context.Background(), fg, fastTune(Options{
 		BackupDir: dir, Stdout: out, Stderr: io.Discard, Stdin: strings.NewReader("3\n"),
-	})
+	}))
 	if err == nil {
 		t.Fatal("expected non-zero exit indication")
 	}
@@ -188,9 +216,9 @@ func TestWipe_AuthFailureAbortsImmediately(t *testing.T) {
 	}
 	out := &bytes.Buffer{}
 
-	res, err := Wipe(context.Background(), fg, Options{
+	res, err := Wipe(context.Background(), fg, fastTune(Options{
 		BackupDir: dir, Stdout: out, Stderr: io.Discard, Stdin: strings.NewReader("5\n"),
-	})
+	}))
 	if err == nil || !errors.Is(err, gateway.ErrAuthFailedSentinel) {
 		t.Errorf("err = %v, want auth failure", err)
 	}
@@ -203,15 +231,139 @@ func TestWipe_ListFailureMakesNoBackup(t *testing.T) {
 	dir := t.TempDir()
 	fg := &fakeGateway{listErr: errors.New("network")}
 
-	_, err := Wipe(context.Background(), fg, Options{
+	_, err := Wipe(context.Background(), fg, fastTune(Options{
 		BackupDir: dir, Stdout: io.Discard, Stderr: io.Discard, Stdin: strings.NewReader(""),
-	})
+	}))
 	if err == nil {
 		t.Fatal("expected list error")
 	}
 	matches, _ := filepath.Glob(filepath.Join(dir, "deezer-loved-tracks-*.json"))
 	if len(matches) != 0 {
 		t.Errorf("no backup should be written on list failure; found: %v", matches)
+	}
+}
+
+// QUOTA_ERROR is the gw-light protocol's own throttle signal. The 2026-04-28
+// run treated it as a one-shot skip; this test pins the new behavior:
+// transient quota → retry after backoff → success → no skip.
+func TestWipe_QuotaErrorRetriesThenSucceeds(t *testing.T) {
+	dir := t.TempDir()
+	calls := map[string]int{}
+	fg := &fakeGateway{
+		songs: makeSongs(2),
+		removeFn: func(_ context.Context, id string) error {
+			calls[id]++
+			if calls[id] == 1 {
+				return quotaErr()
+			}
+			return nil
+		},
+	}
+	out := &bytes.Buffer{}
+
+	opts := fastTune(Options{
+		BackupDir: dir, Stdout: out, Stderr: io.Discard, Stdin: strings.NewReader("2\n"),
+	})
+	opts.RetryBackoff = []time.Duration{time.Microsecond} // one retry, ~instant
+
+	res, err := Wipe(context.Background(), fg, opts)
+	if err != nil {
+		t.Fatalf("Wipe: %v", err)
+	}
+	if res.DeletedCount != 2 || res.SkippedCount != 0 {
+		t.Errorf("res = %+v", res)
+	}
+	if calls["1"] != 2 || calls["2"] != 2 {
+		t.Errorf("expected each track to be tried twice, got %v", calls)
+	}
+}
+
+func TestWipe_QuotaErrorRetriesExhaustedSkips(t *testing.T) {
+	dir := t.TempDir()
+	fg := &fakeGateway{
+		songs:    makeSongs(1),
+		removeFn: func(_ context.Context, _ string) error { return quotaErr() },
+	}
+	out := &bytes.Buffer{}
+
+	opts := fastTune(Options{
+		BackupDir: dir, Stdout: out, Stderr: io.Discard, Stdin: strings.NewReader("1\n"),
+	})
+	opts.RetryBackoff = []time.Duration{time.Microsecond, time.Microsecond}
+
+	res, err := Wipe(context.Background(), fg, opts)
+	if err == nil {
+		t.Fatal("expected non-zero exit indication for skip")
+	}
+	if res.DeletedCount != 0 || res.SkippedCount != 1 {
+		t.Errorf("res = %+v", res)
+	}
+	// initial attempt + 2 retries = 3 total
+	if fg.removeCallCount != 3 {
+		t.Errorf("removeCallCount = %d, want 3 (initial + 2 retries)", fg.removeCallCount)
+	}
+}
+
+func TestWipe_CircuitBreakerAbortsOnConsecutiveFailures(t *testing.T) {
+	dir := t.TempDir()
+	fg := &fakeGateway{
+		songs:    makeSongs(10),
+		removeFn: func(_ context.Context, _ string) error { return quotaErr() },
+	}
+	out := &bytes.Buffer{}
+
+	opts := fastTune(Options{
+		BackupDir: dir, Stdout: out, Stderr: io.Discard, Stdin: strings.NewReader("10\n"),
+	})
+	opts.MaxConsecutiveFinalFailures = 3 // breaker after 3 failed-with-no-success-between
+
+	res, err := Wipe(context.Background(), fg, opts)
+	if err == nil {
+		t.Fatal("expected breaker abort error")
+	}
+	if !strings.Contains(err.Error(), "consecutive") {
+		t.Errorf("error message should mention consecutive failures, got %q", err.Error())
+	}
+	if res.SkippedCount != 3 {
+		t.Errorf("SkippedCount = %d, want 3 (breaker stops at 3rd)", res.SkippedCount)
+	}
+	// once breaker tripped, no further deletes should be attempted
+	// initial-attempt-only on 3 songs = 3 calls (RetryBackoff is empty in fastTune)
+	if fg.removeCallCount != 3 {
+		t.Errorf("removeCallCount = %d, want 3 (no calls past breaker trip)", fg.removeCallCount)
+	}
+}
+
+func TestWipe_CircuitBreakerResetsOnSuccess(t *testing.T) {
+	dir := t.TempDir()
+	// fail, fail, succeed, fail, fail — streak should reset at the success,
+	// so it never reaches 3 consecutive failures.
+	fg := &fakeGateway{
+		songs: makeSongs(5),
+		removeFn: func(_ context.Context, id string) error {
+			if id == "3" {
+				return nil
+			}
+			return quotaErr()
+		},
+	}
+	out := &bytes.Buffer{}
+
+	opts := fastTune(Options{
+		BackupDir: dir, Stdout: out, Stderr: io.Discard, Stdin: strings.NewReader("5\n"),
+	})
+	opts.MaxConsecutiveFinalFailures = 3
+
+	res, err := Wipe(context.Background(), fg, opts)
+	// Run completes (no breaker trip), but skips > 0 → non-nil error from Wipe.
+	if err == nil {
+		t.Fatal("expected non-zero exit for skips")
+	}
+	if strings.Contains(err.Error(), "consecutive") {
+		t.Errorf("breaker should NOT have tripped: %v", err)
+	}
+	if res.DeletedCount != 1 || res.SkippedCount != 4 {
+		t.Errorf("res = %+v, want Deleted=1 Skipped=4", res)
 	}
 }
 
