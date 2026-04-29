@@ -35,11 +35,17 @@ var defaultRetryBackoff = []time.Duration{
 	120 * time.Second,
 }
 
-const (
-	defaultPace                  = time.Second
-	defaultPaceJitter            = 200 * time.Millisecond
-	defaultMaxConsecutiveFailure = 5
+// defaultPace and defaultPaceJitter shape the wipe loop's outbound traffic
+// even on the happy path so we don't burst hard enough to look automated to
+// gw-light's bot scoring (which is what tripped Akamai on 2026-04-28). They
+// are package vars rather than consts so the test binary can zero them in
+// init() without exposing pacing as production-tunable on Options.
+var (
+	defaultPace       = time.Second
+	defaultPaceJitter = 200 * time.Millisecond
 )
+
+const defaultMaxConsecutiveFailure = 5
 
 // Gateway is the slice of internal/gateway.Client used by Wipe.
 type Gateway interface {
@@ -48,6 +54,11 @@ type Gateway interface {
 }
 
 // Options configures a single Wipe run.
+//
+// Tunable fields below follow this convention: the zero value means "use
+// default", and a sentinel (an empty slice or a negative integer) means
+// "disable for tests". Pacing is not exposed here — see defaultPace /
+// defaultPaceJitter in this file; the test binary zeroes them in init().
 type Options struct {
 	DryRun    bool
 	BackupDir string
@@ -56,26 +67,14 @@ type Options struct {
 	Stdout    io.Writer
 	Stderr    io.Writer
 
-	// Pace is the minimum delay before each delete attempt. Zero or unset
-	// uses the default (1s). Negative disables pacing entirely (test only).
-	// Pacing exists so that even on the happy path we don't stream requests
-	// fast enough to look like a bot — which is what tripped Akamai on
-	// 2026-04-28.
-	Pace time.Duration
-
-	// PaceJitter is the random extra delay [0, PaceJitter] added per request.
-	// Zero or unset uses the default (200ms). Ignored when Pace <= 0.
-	PaceJitter time.Duration
-
 	// RetryBackoff is the per-retry sleep schedule for ErrRateLimited /
-	// ErrServerError on a single track. Nil uses the default schedule. An
+	// ErrServerError on a single track. Nil uses defaultRetryBackoff; an
 	// empty slice disables retries (initial attempt only).
 	RetryBackoff []time.Duration
 
-	// MaxConsecutiveFinalFailures aborts the run if this many tracks fail
+	// MaxConsecutiveFinalFailures aborts the run when this many tracks fail
 	// in a row (after their retry budgets are exhausted) with no successful
-	// delete in between. Zero or unset uses the default (5). Negative
-	// disables the breaker (test only).
+	// delete in between. Zero uses the default (5); negative disables.
 	MaxConsecutiveFinalFailures int
 }
 
@@ -113,14 +112,6 @@ func Wipe(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 		opts.BackupDir = "."
 	}
 
-	pace := opts.Pace
-	if pace == 0 {
-		pace = defaultPace
-	}
-	jitter := opts.PaceJitter
-	if jitter == 0 {
-		jitter = defaultPaceJitter
-	}
 	retryBackoff := opts.RetryBackoff
 	if retryBackoff == nil {
 		retryBackoff = defaultRetryBackoff
@@ -182,7 +173,7 @@ func Wipe(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 		default:
 		}
 
-		if err := pacedSleep(ctx, pace, jitter); err != nil {
+		if err := pacedSleep(ctx, defaultPace, defaultPaceJitter); err != nil {
 			res.Elapsed = time.Since(start)
 			return res, err
 		}

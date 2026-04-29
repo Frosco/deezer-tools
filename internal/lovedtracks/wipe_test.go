@@ -47,11 +47,18 @@ func (f *fakeGateway) RemoveFavoriteSong(ctx context.Context, id string) error {
 	return nil
 }
 
-// fastTune disables pacing/retry/breaker so unit tests don't sleep. Tests
-// override the defaults explicitly; the CLI sets production values.
+// init zeroes the package-level pacer defaults so the test binary doesn't
+// sleep ~1s before every delete. This file is only compiled into test
+// binaries; production keeps the real defaults.
+func init() {
+	defaultPace = 0
+	defaultPaceJitter = 0
+}
+
+// fastTune disables retry and the circuit breaker so unit tests don't have
+// to wait through backoffs or trip the streak counter accidentally. Pacing
+// is already zero via init() above.
 func fastTune(o Options) Options {
-	o.Pace = -1
-	o.PaceJitter = -1
 	o.RetryBackoff = []time.Duration{}
 	o.MaxConsecutiveFinalFailures = -1
 	return o
