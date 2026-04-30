@@ -127,3 +127,15 @@ func classifyError(method string, status int, body []byte) *GatewayError {
 	}
 	return &GatewayError{Kind: ErrUnknown, Method: method, Status: status, Message: "unknown error shape"}
 }
+
+// IsRetryable reports whether err is a transient gateway failure that the
+// caller should retry. True for ErrRateLimited (incl. QUOTA_ERROR mapped at
+// HTTP 200) and ErrServerError; false for everything else, including auth
+// and not-found.
+func IsRetryable(err error) bool {
+	var gerr *GatewayError
+	if !errors.As(err, &gerr) {
+		return false
+	}
+	return gerr.Kind == ErrRateLimited || gerr.Kind == ErrServerError
+}

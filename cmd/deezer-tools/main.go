@@ -15,6 +15,7 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(newLovedTracksCmd())
+	rootCmd.AddCommand(newPlaylistsCmd())
 }
 
 func main() {
