@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/niref/deezer-tools/internal/gateway"
+	"github.com/niref/deezer-tools/internal/throttle"
 )
 
 type fakeGateway struct {
@@ -51,8 +52,8 @@ func (f *fakeGateway) RemoveFavoriteSong(ctx context.Context, id string) error {
 // sleep ~1s before every delete. This file is only compiled into test
 // binaries; production keeps the real defaults.
 func init() {
-	defaultPace = 0
-	defaultPaceJitter = 0
+	throttle.Pace = 0
+	throttle.Jitter = 0
 }
 
 // fastTune disables retry and the circuit breaker so unit tests don't have

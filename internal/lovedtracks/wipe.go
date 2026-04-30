@@ -11,41 +11,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/niref/deezer-tools/internal/gateway"
+	"github.com/niref/deezer-tools/internal/throttle"
 )
 
 // ErrAborted is returned when the user fails to confirm the wipe.
 var ErrAborted = errors.New("wipe aborted by user")
-
-// defaultRetryBackoff is the per-retry sleep schedule for ErrRateLimited /
-// ErrServerError responses on a single track. Total ~232s of waiting before
-// a track is given up on. Long enough to cross most short quota windows
-// without amplifying load when one window is genuinely exhausted.
-var defaultRetryBackoff = []time.Duration{
-	5 * time.Second,
-	15 * time.Second,
-	30 * time.Second,
-	60 * time.Second,
-	120 * time.Second,
-}
-
-// defaultPace and defaultPaceJitter shape the wipe loop's outbound traffic
-// even on the happy path so we don't burst hard enough to look automated to
-// gw-light's bot scoring (which is what tripped Akamai on 2026-04-28). They
-// are package vars rather than consts so the test binary can zero them in
-// init() without exposing pacing as production-tunable on Options.
-var (
-	defaultPace       = time.Second
-	defaultPaceJitter = 200 * time.Millisecond
-)
-
-const defaultMaxConsecutiveFailure = 5
 
 // Gateway is the slice of internal/gateway.Client used by Wipe.
 type Gateway interface {
@@ -57,8 +33,8 @@ type Gateway interface {
 //
 // Tunable fields below follow this convention: the zero value means "use
 // default", and a sentinel (an empty slice or a negative integer) means
-// "disable for tests". Pacing is not exposed here — see defaultPace /
-// defaultPaceJitter in this file; the test binary zeroes them in init().
+// "disable for tests". Pacing is not exposed here — see throttle.Pace /
+// throttle.Jitter in internal/throttle; the test binary zeroes them in init().
 type Options struct {
 	DryRun    bool
 	BackupDir string
@@ -68,8 +44,8 @@ type Options struct {
 	Stderr    io.Writer
 
 	// RetryBackoff is the per-retry sleep schedule for ErrRateLimited /
-	// ErrServerError on a single track. Nil uses defaultRetryBackoff; an
-	// empty slice disables retries (initial attempt only).
+	// ErrServerError on a single track. Nil uses throttle.DefaultRetryBackoff;
+	// an empty slice disables retries (initial attempt only).
 	RetryBackoff []time.Duration
 
 	// MaxConsecutiveFinalFailures aborts the run when this many tracks fail
@@ -112,13 +88,10 @@ func Wipe(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 		opts.BackupDir = "."
 	}
 
-	retryBackoff := opts.RetryBackoff
-	if retryBackoff == nil {
-		retryBackoff = defaultRetryBackoff
-	}
+	retryBackoff := opts.RetryBackoff // throttle.RunOne handles nil
 	maxConsec := opts.MaxConsecutiveFinalFailures
 	if maxConsec == 0 {
-		maxConsec = defaultMaxConsecutiveFailure
+		maxConsec = throttle.DefaultMaxConsecutiveFinalFailures
 	}
 
 	start := time.Now()
@@ -173,12 +146,14 @@ func Wipe(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 		default:
 		}
 
-		if err := pacedSleep(ctx, defaultPace, defaultPaceJitter); err != nil {
+		if err := throttle.Sleep(ctx); err != nil {
 			res.Elapsed = time.Since(start)
 			return res, err
 		}
-
-		if err := deleteWithRetry(ctx, gw, s.ID, retryBackoff); err != nil {
+		id := s.ID
+		if err := throttle.RunOne(ctx, func(ctx context.Context) error {
+			return gw.RemoveFavoriteSong(ctx, id)
+		}, gateway.IsRetryable, retryBackoff); err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				res.Elapsed = time.Since(start)
 				return res, err
@@ -288,57 +263,4 @@ func writeSkipEntry(w io.Writer, s gateway.FavoriteSong, err error) error {
 	b, _ := json.Marshal(entry)
 	_, werr := fmt.Fprintln(w, string(b))
 	return werr
-}
-
-// pacedSleep waits pace + rand[0, jitter) before returning, honoring ctx.
-// pace <= 0 disables the wait entirely. Jitter <= 0 just sleeps pace.
-func pacedSleep(ctx context.Context, pace, jitter time.Duration) error {
-	if pace <= 0 {
-		return nil
-	}
-	d := pace
-	if jitter > 0 {
-		d += time.Duration(rand.Int64N(int64(jitter)))
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(d):
-		return nil
-	}
-}
-
-func deleteWithRetry(ctx context.Context, gw Gateway, songID string, retryBackoff []time.Duration) error {
-	// CSRF refresh is handled inside the gateway client (callWithCSRF), so
-	// this layer only retries on transient transport failures: ErrRateLimited
-	// (incl. QUOTA_ERROR mapped from gw-light) and ErrServerError. Auth
-	// failures and per-track 4xx errors return immediately and are handled
-	// by the caller.
-	err := gw.RemoveFavoriteSong(ctx, songID)
-	if err == nil {
-		return nil
-	}
-	for _, d := range retryBackoff {
-		if !shouldRetry(err) {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(d):
-		}
-		err = gw.RemoveFavoriteSong(ctx, songID)
-		if err == nil {
-			return nil
-		}
-	}
-	return err
-}
-
-func shouldRetry(err error) bool {
-	var gerr *gateway.GatewayError
-	if !errors.As(err, &gerr) {
-		return false
-	}
-	return gerr.Kind == gateway.ErrRateLimited || gerr.Kind == gateway.ErrServerError
 }
