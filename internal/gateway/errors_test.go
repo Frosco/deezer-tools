@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -77,5 +78,32 @@ func TestGatewayError_ErrorsIs(t *testing.T) {
 	gerr := &GatewayError{Kind: ErrAuthFailed, Method: "x", Message: "y"}
 	if !errors.Is(gerr, ErrAuthFailedSentinel) {
 		t.Errorf("errors.Is should match sentinel for kind ErrAuthFailed")
+	}
+}
+
+func TestIsRetryable(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"non-gateway error", errors.New("plain"), false},
+		{"rate limited", &GatewayError{Kind: ErrRateLimited}, true},
+		{"server error", &GatewayError{Kind: ErrServerError}, true},
+		{"auth failed", &GatewayError{Kind: ErrAuthFailed}, false},
+		{"csrf expired", &GatewayError{Kind: ErrCSRFExpired}, false},
+		{"not found", &GatewayError{Kind: ErrNotFound}, false},
+		{"unknown", &GatewayError{Kind: ErrUnknown}, false},
+		{"wrapped rate limited",
+			fmt.Errorf("removeFavoriteSong: %w", &GatewayError{Kind: ErrRateLimited}),
+			true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsRetryable(tc.err); got != tc.want {
+				t.Errorf("IsRetryable(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }
