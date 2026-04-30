@@ -1011,8 +1011,10 @@ git commit -m "feat(gateway): paginate playlist.getSongs"
 - Create: `internal/gateway/albums_test.go`
 
 Two methods:
-1. `ListFavoriteAlbumIDs(ctx, pageSize int) ([]string, error)` — paginate `album.getFavoriteIds`. The orchestrator only needs IDs for the diff.
-2. `AddFavoriteAlbum(ctx, albumID string) error` — `favorite_album.add`.
+1. `ListFavoriteAlbumIDs(ctx) ([]string, error)` — single `deezer.pageProfile` call with `tab="albums"`. The orchestrator only needs IDs for the diff.
+2. `AddFavoriteAlbum(ctx, albumID string) error` — `album.addFavorite`.
+
+**T2 research note (2026-04-30):** the plan originally named these methods `album.getFavoriteIds` and `favorite_album.add`. Neither is correct in the canonical OSS sources (deemix `packages/deezer-sdk/src/gw.ts`, deezer-py `deezer/gw.py`). The verified write method is `album.addFavorite`. The verified listing path is `deezer.pageProfile` with `{USER_ID, tab: "albums", nb}` reading `results.TAB.albums.data[].ALB_ID`. See `docs/superpowers/research/2026-04-30-deezer-favorites-protocol.md`.
 
 Same conventions as `tracks.go`: `callWithCSRF`, `flexString` for ID-shaped fields, classified errors.
 
@@ -1029,24 +1031,20 @@ import (
 	"testing"
 )
 
-func TestListFavoriteAlbumIDs_paginates(t *testing.T) {
+func TestListFavoriteAlbumIDs_singleCall(t *testing.T) {
 	calls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Query().Get("method") {
 		case "deezer.getUserData":
 			w.Write([]byte(`{"results":{"checkForm":"tok","USER":{"USER_ID":42}}}`))
-		case "album.getFavoriteIds":
+		case "deezer.pageProfile":
 			calls++
 			body, _ := readBody(r)
 			s := string(body)
-			switch {
-			case strings.Contains(s, `"start":0`):
-				w.Write([]byte(`{"results":{"data":[{"ALB_ID":"1"},{"ALB_ID":"2"}],"total":3}}`))
-			case strings.Contains(s, `"start":2`):
-				w.Write([]byte(`{"results":{"data":[{"ALB_ID":"3"}],"total":3}}`))
-			default:
-				t.Errorf("unexpected start in body: %s", s)
+			if !strings.Contains(s, `"tab":"albums"`) {
+				t.Errorf("expected tab=albums in body: %s", s)
 			}
+			w.Write([]byte(`{"results":{"TAB":{"albums":{"data":[{"ALB_ID":"1"},{"ALB_ID":"2"},{"ALB_ID":"3"}],"total":3}}}}`))
 		}
 	}))
 	defer srv.Close()
@@ -1054,15 +1052,15 @@ func TestListFavoriteAlbumIDs_paginates(t *testing.T) {
 	c := New("test-arl")
 	c.baseURL = srv.URL
 
-	got, err := c.ListFavoriteAlbumIDs(context.Background(), 2)
+	got, err := c.ListFavoriteAlbumIDs(context.Background())
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
 	if len(got) != 3 || got[0] != "1" || got[2] != "3" {
 		t.Errorf("got = %v, want [1 2 3]", got)
 	}
-	if calls != 2 {
-		t.Errorf("calls = %d, want 2", calls)
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1", calls)
 	}
 }
 
@@ -1071,8 +1069,8 @@ func TestListFavoriteAlbumIDs_acceptsNumericALBID(t *testing.T) {
 		switch r.URL.Query().Get("method") {
 		case "deezer.getUserData":
 			w.Write([]byte(`{"results":{"checkForm":"tok","USER":{"USER_ID":42}}}`))
-		case "album.getFavoriteIds":
-			w.Write([]byte(`{"results":{"data":[{"ALB_ID":42},{"ALB_ID":"43"}],"total":2}}`))
+		case "deezer.pageProfile":
+			w.Write([]byte(`{"results":{"TAB":{"albums":{"data":[{"ALB_ID":42},{"ALB_ID":"43"}],"total":2}}}}`))
 		}
 	}))
 	defer srv.Close()
@@ -1080,7 +1078,7 @@ func TestListFavoriteAlbumIDs_acceptsNumericALBID(t *testing.T) {
 	c := New("test-arl")
 	c.baseURL = srv.URL
 
-	got, err := c.ListFavoriteAlbumIDs(context.Background(), 100)
+	got, err := c.ListFavoriteAlbumIDs(context.Background())
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -1095,7 +1093,7 @@ func TestAddFavoriteAlbum_success(t *testing.T) {
 		switch r.URL.Query().Get("method") {
 		case "deezer.getUserData":
 			w.Write([]byte(`{"results":{"checkForm":"tok","USER":{"USER_ID":42}}}`))
-		case "favorite_album.add":
+		case "album.addFavorite":
 			body, _ := readBody(r)
 			s := string(body)
 			switch {
@@ -1123,7 +1121,7 @@ func TestAddFavoriteAlbum_classifiedError(t *testing.T) {
 		switch r.URL.Query().Get("method") {
 		case "deezer.getUserData":
 			w.Write([]byte(`{"results":{"checkForm":"tok","USER":{"USER_ID":42}}}`))
-		case "favorite_album.add":
+		case "album.addFavorite":
 			w.Write([]byte(`{"error":{"QUOTA_ERROR":"Quota exceeded"}}`))
 		}
 	}))
@@ -1179,64 +1177,61 @@ import (
 )
 
 const (
-	getFavoriteAlbumIDsMethod = "album.getFavoriteIds"
-	addFavoriteAlbumMethod    = "favorite_album.add"
-	favoriteAlbumPageSize     = 1000
+	pageProfileMethod      = "deezer.pageProfile"
+	addFavoriteAlbumMethod = "album.addFavorite"
+	// pageProfileNb is the per-tab "give me everything" limit. The gateway is
+	// observed to honor large nb values and return a single page; if a real
+	// account hits truncation in the wild, switch to a smaller nb plus the
+	// nonexistent-but-likely `start` paging knob (discovered at impl time).
+	pageProfileNb = 2000
 )
 
-// favoriteAlbumIDRecord is the per-album record shape from album.getFavoriteIds.
+// favoriteAlbumIDRecord is the per-album record shape returned in
+// results.TAB.albums.data[] from deezer.pageProfile (tab="albums").
 type favoriteAlbumIDRecord struct {
 	ID flexString `json:"ALB_ID"`
 }
 
-// ListFavoriteAlbumIDs paginates album.getFavoriteIds and returns every loved
-// album ID for the authenticated user. pageSize <= 0 uses the default.
+// ListFavoriteAlbumIDs returns every loved album ID for the authenticated
+// user via a single deezer.pageProfile call (tab="albums").
 //
 // CSRF acquisition and refresh are handled by callWithCSRF.
-func (c *Client) ListFavoriteAlbumIDs(ctx context.Context, pageSize int) ([]string, error) {
-	if pageSize <= 0 {
-		pageSize = favoriteAlbumPageSize
-	}
+func (c *Client) ListFavoriteAlbumIDs(ctx context.Context) ([]string, error) {
 	if err := c.ensureCSRF(ctx); err != nil {
 		return nil, err
 	}
-	var out []string
-	start := 0
-	for {
-		body := map[string]any{
-			"user_id":  c.userID,
-			"start":    start,
-			"nb":       pageSize,
-			"checksum": nil,
-		}
-		raw, err := c.callWithCSRF(ctx, getFavoriteAlbumIDsMethod, body)
-		if err != nil {
-			return nil, fmt.Errorf("%s start=%d: %w", getFavoriteAlbumIDsMethod, start, err)
-		}
-		var page struct {
-			Data  []favoriteAlbumIDRecord `json:"data"`
-			Total int                     `json:"total"`
-		}
-		if err := json.Unmarshal(raw, &page); err != nil {
-			return nil, fmt.Errorf("decode %s start=%d: %w", getFavoriteAlbumIDsMethod, start, err)
-		}
-		if len(page.Data) == 0 {
-			break
-		}
-		for _, r := range page.Data {
-			out = append(out, string(r.ID))
-		}
-		start += len(page.Data)
-		if page.Total > 0 && start >= page.Total {
-			break
-		}
+	body := map[string]any{
+		"USER_ID": c.userID,
+		"tab":     "albums",
+		"nb":      pageProfileNb,
+	}
+	raw, err := c.callWithCSRF(ctx, pageProfileMethod, body)
+	if err != nil {
+		return nil, fmt.Errorf("%s tab=albums: %w", pageProfileMethod, err)
+	}
+	var resp struct {
+		TAB struct {
+			Albums struct {
+				Data  []favoriteAlbumIDRecord `json:"data"`
+				Total int                     `json:"total"`
+			} `json:"albums"`
+		} `json:"TAB"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("decode %s tab=albums: %w", pageProfileMethod, err)
+	}
+	out := make([]string, 0, len(resp.TAB.Albums.Data))
+	for _, r := range resp.TAB.Albums.Data {
+		out = append(out, string(r.ID))
 	}
 	return out, nil
 }
 
 // AddFavoriteAlbum loves the album with the given Deezer ALB_ID.
-// Idempotent on the gateway side: re-adding an already-loved album is a no-op
-// (verified shape recorded in docs/superpowers/research/2026-04-30-deezer-favorites-protocol.md).
+// Idempotency on the gateway side is unverified in OSS sources — see
+// docs/superpowers/research/2026-04-30-deezer-favorites-protocol.md. If a wet
+// run shows an error envelope on already-loved, add a classifier branch in
+// internal/gateway/errors.go to map it to success.
 //
 // Returns a *GatewayError on classified failure.
 func (c *Client) AddFavoriteAlbum(ctx context.Context, albumID string) error {
@@ -1275,7 +1270,7 @@ git commit -m "feat(gateway): list and add favorite albums"
 - Create: `internal/gateway/artists.go`
 - Create: `internal/gateway/artists_test.go`
 
-Identical structure to Task 6, with `ART_ID` instead of `ALB_ID` and `artist.getFavoriteIds` / `favorite_artist.add` as the methods.
+Identical structure to Task 6, with `ART_ID` instead of `ALB_ID`. Listing path is `deezer.pageProfile` with `tab="artists"`; add path is `artist.addFavorite` (verified per the 2026-04-30 research doc; the plan's original assumed names `artist.getFavoriteIds` / `favorite_artist.add` were wrong).
 
 - [ ] **Step 1: Write failing tests in `internal/gateway/artists_test.go`**
 
@@ -1290,22 +1285,20 @@ import (
 	"testing"
 )
 
-func TestListFavoriteArtistIDs_paginates(t *testing.T) {
+func TestListFavoriteArtistIDs_singleCall(t *testing.T) {
 	calls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Query().Get("method") {
 		case "deezer.getUserData":
 			w.Write([]byte(`{"results":{"checkForm":"tok","USER":{"USER_ID":42}}}`))
-		case "artist.getFavoriteIds":
+		case "deezer.pageProfile":
 			calls++
 			body, _ := readBody(r)
 			s := string(body)
-			switch {
-			case strings.Contains(s, `"start":0`):
-				w.Write([]byte(`{"results":{"data":[{"ART_ID":"10"},{"ART_ID":"20"}],"total":3}}`))
-			case strings.Contains(s, `"start":2`):
-				w.Write([]byte(`{"results":{"data":[{"ART_ID":"30"}],"total":3}}`))
+			if !strings.Contains(s, `"tab":"artists"`) {
+				t.Errorf("expected tab=artists in body: %s", s)
 			}
+			w.Write([]byte(`{"results":{"TAB":{"artists":{"data":[{"ART_ID":"10"},{"ART_ID":"20"},{"ART_ID":"30"}],"total":3}}}}`))
 		}
 	}))
 	defer srv.Close()
@@ -1313,15 +1306,15 @@ func TestListFavoriteArtistIDs_paginates(t *testing.T) {
 	c := New("test-arl")
 	c.baseURL = srv.URL
 
-	got, err := c.ListFavoriteArtistIDs(context.Background(), 2)
+	got, err := c.ListFavoriteArtistIDs(context.Background())
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
 	if len(got) != 3 || got[0] != "10" || got[2] != "30" {
 		t.Errorf("got = %v", got)
 	}
-	if calls != 2 {
-		t.Errorf("calls = %d, want 2", calls)
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1", calls)
 	}
 }
 
@@ -1330,8 +1323,8 @@ func TestListFavoriteArtistIDs_acceptsNumericARTID(t *testing.T) {
 		switch r.URL.Query().Get("method") {
 		case "deezer.getUserData":
 			w.Write([]byte(`{"results":{"checkForm":"tok","USER":{"USER_ID":42}}}`))
-		case "artist.getFavoriteIds":
-			w.Write([]byte(`{"results":{"data":[{"ART_ID":99},{"ART_ID":"100"}],"total":2}}`))
+		case "deezer.pageProfile":
+			w.Write([]byte(`{"results":{"TAB":{"artists":{"data":[{"ART_ID":99},{"ART_ID":"100"}],"total":2}}}}`))
 		}
 	}))
 	defer srv.Close()
@@ -1339,7 +1332,7 @@ func TestListFavoriteArtistIDs_acceptsNumericARTID(t *testing.T) {
 	c := New("test-arl")
 	c.baseURL = srv.URL
 
-	got, err := c.ListFavoriteArtistIDs(context.Background(), 100)
+	got, err := c.ListFavoriteArtistIDs(context.Background())
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -1354,7 +1347,7 @@ func TestAddFavoriteArtist_success(t *testing.T) {
 		switch r.URL.Query().Get("method") {
 		case "deezer.getUserData":
 			w.Write([]byte(`{"results":{"checkForm":"tok","USER":{"USER_ID":42}}}`))
-		case "favorite_artist.add":
+		case "artist.addFavorite":
 			body, _ := readBody(r)
 			if strings.Contains(string(body), `"ART_ID":"500"`) {
 				seenART = "500"
@@ -1394,60 +1387,52 @@ import (
 )
 
 const (
-	getFavoriteArtistIDsMethod = "artist.getFavoriteIds"
-	addFavoriteArtistMethod    = "favorite_artist.add"
-	favoriteArtistPageSize     = 1000
+	addFavoriteArtistMethod = "artist.addFavorite"
 )
 
+// favoriteArtistIDRecord is the per-artist record shape returned in
+// results.TAB.artists.data[] from deezer.pageProfile (tab="artists").
 type favoriteArtistIDRecord struct {
 	ID flexString `json:"ART_ID"`
 }
 
-// ListFavoriteArtistIDs paginates artist.getFavoriteIds and returns every
-// loved artist ID for the authenticated user. pageSize <= 0 uses the default.
-func (c *Client) ListFavoriteArtistIDs(ctx context.Context, pageSize int) ([]string, error) {
-	if pageSize <= 0 {
-		pageSize = favoriteArtistPageSize
-	}
+// ListFavoriteArtistIDs returns every loved artist ID for the authenticated
+// user via a single deezer.pageProfile call (tab="artists"). pageProfileMethod
+// and pageProfileNb are defined alongside the album listing in albums.go.
+func (c *Client) ListFavoriteArtistIDs(ctx context.Context) ([]string, error) {
 	if err := c.ensureCSRF(ctx); err != nil {
 		return nil, err
 	}
-	var out []string
-	start := 0
-	for {
-		body := map[string]any{
-			"user_id":  c.userID,
-			"start":    start,
-			"nb":       pageSize,
-			"checksum": nil,
-		}
-		raw, err := c.callWithCSRF(ctx, getFavoriteArtistIDsMethod, body)
-		if err != nil {
-			return nil, fmt.Errorf("%s start=%d: %w", getFavoriteArtistIDsMethod, start, err)
-		}
-		var page struct {
-			Data  []favoriteArtistIDRecord `json:"data"`
-			Total int                      `json:"total"`
-		}
-		if err := json.Unmarshal(raw, &page); err != nil {
-			return nil, fmt.Errorf("decode %s start=%d: %w", getFavoriteArtistIDsMethod, start, err)
-		}
-		if len(page.Data) == 0 {
-			break
-		}
-		for _, r := range page.Data {
-			out = append(out, string(r.ID))
-		}
-		start += len(page.Data)
-		if page.Total > 0 && start >= page.Total {
-			break
-		}
+	body := map[string]any{
+		"USER_ID": c.userID,
+		"tab":     "artists",
+		"nb":      pageProfileNb,
+	}
+	raw, err := c.callWithCSRF(ctx, pageProfileMethod, body)
+	if err != nil {
+		return nil, fmt.Errorf("%s tab=artists: %w", pageProfileMethod, err)
+	}
+	var resp struct {
+		TAB struct {
+			Artists struct {
+				Data  []favoriteArtistIDRecord `json:"data"`
+				Total int                      `json:"total"`
+			} `json:"artists"`
+		} `json:"TAB"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("decode %s tab=artists: %w", pageProfileMethod, err)
+	}
+	out := make([]string, 0, len(resp.TAB.Artists.Data))
+	for _, r := range resp.TAB.Artists.Data {
+		out = append(out, string(r.ID))
 	}
 	return out, nil
 }
 
 // AddFavoriteArtist loves the artist with the given Deezer ART_ID.
-// Idempotent on the gateway side. Returns *GatewayError on classified failure.
+// Idempotency on the gateway side is unverified in OSS sources — see the
+// research doc dated 2026-04-30. Returns *GatewayError on classified failure.
 func (c *Client) AddFavoriteArtist(ctx context.Context, artistID string) error {
 	body := map[string]any{"ART_ID": artistID}
 	if _, err := c.callWithCSRF(ctx, addFavoriteArtistMethod, body); err != nil {
@@ -2123,14 +2108,14 @@ func (f *fakeGateway) ListPlaylistSongs(ctx context.Context, id string, _ int) (
 	return f.playlistSongs[id], nil
 }
 
-func (f *fakeGateway) ListFavoriteAlbumIDs(ctx context.Context, _ int) ([]string, error) {
+func (f *fakeGateway) ListFavoriteAlbumIDs(ctx context.Context) ([]string, error) {
 	if f.listLovedAlbumsErr != nil {
 		return nil, f.listLovedAlbumsErr
 	}
 	return f.lovedAlbumIDs, nil
 }
 
-func (f *fakeGateway) ListFavoriteArtistIDs(ctx context.Context, _ int) ([]string, error) {
+func (f *fakeGateway) ListFavoriteArtistIDs(ctx context.Context) ([]string, error) {
 	if f.listLovedArtistsErr != nil {
 		return nil, f.listLovedArtistsErr
 	}
@@ -2283,7 +2268,7 @@ func TestRun_perItemFailureGoesToSkipLog(t *testing.T) {
 			},
 		},
 		addAlbumErrs: map[string]error{
-			"101": &gateway.GatewayError{Kind: gateway.ErrNotFound, Method: "favorite_album.add", Message: "DATA_ERROR"},
+			"101": &gateway.GatewayError{Kind: gateway.ErrNotFound, Method: "album.addFavorite", Message: "DATA_ERROR"},
 		},
 	}
 	res, err := Run(context.Background(), gw, defaultOpts("yes\n", dir, "1"))
@@ -2308,7 +2293,7 @@ func TestRun_authFailureDuringApplyAborts(t *testing.T) {
 			"1": {{SongID: "s1", AlbumID: "100", AlbumTitle: "A", ArtistID: "10", ArtistName: "X"}},
 		},
 		addAlbumErrs: map[string]error{
-			"100": &gateway.GatewayError{Kind: gateway.ErrAuthFailed, Method: "favorite_album.add", Message: "USER_AUTH_REQUIRED"},
+			"100": &gateway.GatewayError{Kind: gateway.ErrAuthFailed, Method: "album.addFavorite", Message: "USER_AUTH_REQUIRED"},
 		},
 	}
 	_, err := Run(context.Background(), gw, defaultOpts("yes\n", dir, "1"))
@@ -2319,7 +2304,7 @@ func TestRun_authFailureDuringApplyAborts(t *testing.T) {
 
 func TestRun_breakerTripsAfterNConsecutiveFailures(t *testing.T) {
 	dir := tmpBackupDir(t)
-	transient := &gateway.GatewayError{Kind: gateway.ErrServerError, Method: "favorite_album.add", Message: "500"}
+	transient := &gateway.GatewayError{Kind: gateway.ErrServerError, Method: "album.addFavorite", Message: "500"}
 	gw := &fakeGateway{
 		playlistSongs: map[string][]gateway.PlaylistSong{
 			"1": {
@@ -2456,8 +2441,8 @@ var ErrAborted = errors.New("playlistlove: aborted by user")
 // lets tests fake transport without spinning up an HTTP server.
 type Gateway interface {
 	ListPlaylistSongs(ctx context.Context, playlistID string, pageSize int) ([]gateway.PlaylistSong, error)
-	ListFavoriteAlbumIDs(ctx context.Context, pageSize int) ([]string, error)
-	ListFavoriteArtistIDs(ctx context.Context, pageSize int) ([]string, error)
+	ListFavoriteAlbumIDs(ctx context.Context) ([]string, error)
+	ListFavoriteArtistIDs(ctx context.Context) ([]string, error)
 	AddFavoriteAlbum(ctx context.Context, albumID string) error
 	AddFavoriteArtist(ctx context.Context, artistID string) error
 }
@@ -2611,12 +2596,13 @@ func Run(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 	// 4. Aggregate + dedupe.
 	set := Aggregate(allSongs, opts.VariousArtistsID)
 
-	// 5. Read loved sets.
-	lovedAlbums, err := gw.ListFavoriteAlbumIDs(ctx, opts.PageSize)
+	// 5. Read loved sets. Both methods are single-call (deezer.pageProfile);
+	// no pagination knob needed — see the 2026-04-30 research doc.
+	lovedAlbums, err := gw.ListFavoriteAlbumIDs(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list loved albums: %w", err)
 	}
-	lovedArtists, err := gw.ListFavoriteArtistIDs(ctx, opts.PageSize)
+	lovedArtists, err := gw.ListFavoriteArtistIDs(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list loved artists: %w", err)
 	}
@@ -3027,7 +3013,7 @@ git commit -m "feat(cmd): wire playlists love-contents subcommand"
 **Files:**
 - Modify: `internal/gateway/integration_test.go`
 
-Mirror the existing `DEEZER_INTEGRATION=1` pattern. Add three read-only checks: `playlist.getSongs` against a known-public playlist (pick a stable Deezer editorial playlist ID at run time and document it), `album.getFavoriteIds` against the live account, and `artist.getFavoriteIds` against the live account. **No write methods are called** by integration tests.
+Mirror the existing `DEEZER_INTEGRATION=1` pattern. Add three read-only checks: `playlist.getSongs` against a known-public playlist (pick a stable Deezer editorial playlist ID at run time and document it), `deezer.pageProfile` with `tab="albums"` against the live account, and `deezer.pageProfile` with `tab="artists"` against the live account. **No write methods are called** by integration tests.
 
 This task also produces the implementation-side discoveries for the spec's known-unknowns: Various-Artists `ART_ID` actually emitted on a real playlist, idempotency response shape, and any ceiling-error code (only checked manually if the user has > some threshold of loved albums).
 
@@ -3070,7 +3056,7 @@ func TestIntegration_ListFavoriteAlbumIDs(t *testing.T) {
 	}
 	arl := loadIntegrationARL(t)
 	c := New(arl)
-	ids, err := c.ListFavoriteAlbumIDs(context.Background(), 100)
+	ids, err := c.ListFavoriteAlbumIDs(context.Background())
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -3083,7 +3069,7 @@ func TestIntegration_ListFavoriteArtistIDs(t *testing.T) {
 	}
 	arl := loadIntegrationARL(t)
 	c := New(arl)
-	ids, err := c.ListFavoriteArtistIDs(context.Background(), 100)
+	ids, err := c.ListFavoriteArtistIDs(context.Background())
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -3235,7 +3221,7 @@ Then create the MR (via `gh pr create` or the equivalent for your remote). The M
 
 ## Risks & known unknowns recorded against tasks
 
-- **Method names** for `playlist.getSongs` / `album.getFavoriteIds` / `favorite_album.add` / `artist.getFavoriteIds` / `favorite_artist.add` — Task 2 is the verification gate. If any name differs from the assumption in this plan, edit the relevant Task 5/6/7 string constants before implementing.
-- **Various-Artists `ART_ID`** — Task 2 asserts in the research doc. Task 12 validates against live data. If different, update `playlistlove.DefaultVariousArtistsID` and the research doc, no code-shape change required.
-- **Idempotency response on add** — Task 2 captures the shape. If `favorite_album.add` for an already-loved album returns an error envelope, add a classifier branch in `internal/gateway/errors.go` to map it to success.
+- **Method names** — Task 2 (2026-04-30 research) verified: `playlist.getSongs` (correct), `album.addFavorite` (was `favorite_album.add`), `artist.addFavorite` (was `favorite_artist.add`). Listing favorite albums/artists uses `deezer.pageProfile` with `tab="albums"` / `tab="artists"` — there is no `<entity>.getFavoriteIds` method for albums or artists. The plan is updated accordingly.
+- **Various-Artists `ART_ID`** — verified `5080` from `deemix/packages/deemix/src/types/index.ts:1` and `deemix-py/deemix/types/__init__.py:1` (two independent ports declare it as a named constant). Task 12 validates against live data. If different, update `playlistlove.DefaultVariousArtistsID` and the research doc; no code-shape change required.
+- **Idempotency response on add** — Task 2 could not verify in OSS (both libraries fire-and-forget). If `album.addFavorite` for an already-loved album returns an error envelope, add a classifier branch in `internal/gateway/errors.go` to map it to success. Discovered at first wet run.
 - **Loved-album / loved-artist ceiling** — unverified. Task 13 step 5 catches it on a manual real run; if hit, add `ErrLimitReached` kind and abort behaviour as a follow-up commit on the same WIP branch.
