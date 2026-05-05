@@ -1,6 +1,11 @@
 package lovedalbums
 
-import "testing"
+import (
+	"sort"
+	"testing"
+
+	"github.com/niref/deezer-tools/internal/gateway"
+)
 
 func TestNormalise(t *testing.T) {
 	cases := []struct {
@@ -38,4 +43,91 @@ func TestNormalise(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDetectCase1_groupsSameArtistSameTitle(t *testing.T) {
+	loved := []gateway.AlbumMetadata{
+		{ID: "1", Title: "Random Access Memories", ArtistID: "8537", TrackCount: 13, FanCount: 1000},
+		{ID: "2", Title: "RANDOM ACCESS MEMORIES", ArtistID: "8537", TrackCount: 13, FanCount: 5},
+		{ID: "3", Title: "Discovery", ArtistID: "8537", TrackCount: 14, FanCount: 100},
+	}
+	groups := DetectCase1(loved)
+	if len(groups) != 1 {
+		t.Fatalf("len(groups) = %d, want 1", len(groups))
+	}
+	g := groups[0]
+	if g.ArtistID != "8537" {
+		t.Errorf("ArtistID = %s", g.ArtistID)
+	}
+	if g.NormalisedKey != "random access memories" {
+		t.Errorf("NormalisedKey = %s", g.NormalisedKey)
+	}
+	if len(g.Members) != 2 {
+		t.Errorf("Members = %d, want 2", len(g.Members))
+	}
+	if g.Members[0].ID != "1" {
+		t.Errorf("winner = %s, want 1", g.Members[0].ID)
+	}
+}
+
+func TestDetectCase1_doesNotGroupAcrossArtists(t *testing.T) {
+	loved := []gateway.AlbumMetadata{
+		{ID: "1", Title: "Greatest Hits", ArtistID: "1"},
+		{ID: "2", Title: "Greatest Hits", ArtistID: "2"},
+	}
+	groups := DetectCase1(loved)
+	if len(groups) != 0 {
+		t.Errorf("len(groups) = %d, want 0", len(groups))
+	}
+}
+
+func TestDetectCase1_singletonsAreNotGroups(t *testing.T) {
+	loved := []gateway.AlbumMetadata{
+		{ID: "1", Title: "A", ArtistID: "1"},
+		{ID: "2", Title: "B", ArtistID: "1"},
+	}
+	groups := DetectCase1(loved)
+	if len(groups) != 0 {
+		t.Errorf("len(groups) = %d, want 0", len(groups))
+	}
+}
+
+func TestDetectCase1_threeMemberGroup(t *testing.T) {
+	loved := []gateway.AlbumMetadata{
+		{ID: "1", Title: "X", ArtistID: "1", TrackCount: 1},
+		{ID: "2", Title: "x", ArtistID: "1", TrackCount: 5},
+		{ID: "3", Title: "X ", ArtistID: "1", TrackCount: 3},
+	}
+	groups := DetectCase1(loved)
+	if len(groups) != 1 || len(groups[0].Members) != 3 {
+		t.Fatalf("groups = %+v", groups)
+	}
+	if groups[0].Members[0].ID != "2" {
+		t.Errorf("winner = %s, want 2", groups[0].Members[0].ID)
+	}
+}
+
+func TestDetectCase1_deterministicOrder(t *testing.T) {
+	loved := []gateway.AlbumMetadata{
+		{ID: "a1", Title: "B", ArtistID: "2"},
+		{ID: "a2", Title: "B", ArtistID: "2"},
+		{ID: "b1", Title: "A", ArtistID: "1"},
+		{ID: "b2", Title: "A", ArtistID: "1"},
+	}
+	groups := DetectCase1(loved)
+	if len(groups) != 2 {
+		t.Fatalf("len = %d, want 2", len(groups))
+	}
+	if groups[0].ArtistID != "1" || groups[1].ArtistID != "2" {
+		t.Errorf("artist order = [%s %s]", groups[0].ArtistID, groups[1].ArtistID)
+	}
+}
+
+func ids(group []gateway.AlbumMetadata) []string {
+	out := make([]string, len(group))
+	for i, m := range group {
+		out[i] = m.ID
+	}
+	sort.Strings(out)
+	return out
 }

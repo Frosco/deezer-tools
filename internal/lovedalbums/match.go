@@ -10,10 +10,13 @@
 package lovedalbums
 
 import (
+	"sort"
 	"strings"
 	"unicode"
 
 	"golang.org/x/text/unicode/norm"
+
+	"github.com/niref/deezer-tools/internal/gateway"
 )
 
 // Normalise applies the title-normalisation rules used for both Case-1
@@ -45,4 +48,50 @@ func Normalise(s string) string {
 		}
 	}
 	return strings.Join(strings.Fields(b.String()), " ")
+}
+
+// Case1Group is a set of loved albums that share the same artist and the
+// same normalised title. Members[0] is the winner (PickWinner ordering);
+// the remaining members are losers to be un-loved.
+type Case1Group struct {
+	ArtistID      string
+	ArtistName    string
+	NormalisedKey string
+	Members       []gateway.AlbumMetadata
+}
+
+// DetectCase1 returns one Case1Group per duplicate cluster found in the
+// loved-album set. Singletons (no duplicate) are not returned. The result is
+// sorted deterministically by (ArtistID, NormalisedKey) so two runs over the
+// same input produce identical output.
+func DetectCase1(loved []gateway.AlbumMetadata) []Case1Group {
+	type key struct{ artist, title string }
+	bucket := make(map[key][]gateway.AlbumMetadata)
+	artistName := make(map[string]string)
+	for _, a := range loved {
+		k := key{a.ArtistID, Normalise(a.Title)}
+		bucket[k] = append(bucket[k], a)
+		if _, ok := artistName[a.ArtistID]; !ok {
+			artistName[a.ArtistID] = a.ArtistName
+		}
+	}
+	out := make([]Case1Group, 0)
+	for k, members := range bucket {
+		if len(members) < 2 {
+			continue
+		}
+		out = append(out, Case1Group{
+			ArtistID:      k.artist,
+			ArtistName:    artistName[k.artist],
+			NormalisedKey: k.title,
+			Members:       PickWinner(members),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ArtistID != out[j].ArtistID {
+			return out[i].ArtistID < out[j].ArtistID
+		}
+		return out[i].NormalisedKey < out[j].NormalisedKey
+	})
+	return out
 }
