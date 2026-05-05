@@ -1,7 +1,13 @@
 package playlistlove
 
 import (
+	"context"
+	"errors"
+	"time"
+
 	"github.com/niref/deezer-tools/internal/gateway"
+	"github.com/niref/deezer-tools/internal/lovedalbums"
+	"github.com/niref/deezer-tools/internal/throttle"
 )
 
 // Album is a deduped (ALB_ID, ALB_TITLE, primary ART_NAME) record for the
@@ -20,10 +26,11 @@ type Artist struct {
 // AggregatedSet is the dedupe output: unique albums and artists across all
 // songs, with per-cohort counts surfaced for the run summary.
 type AggregatedSet struct {
-	Albums                []Album
-	Artists               []Artist
-	UnparseableSongs      int
-	VariousArtistsSkipped int
+	Albums                        []Album
+	Artists                       []Artist
+	UnparseableSongs              int
+	VariousArtistsSkipped         int
+	Case1WithinPlaylistSuppressed int
 }
 
 // DefaultVariousArtistsID is the ART_ID that gw-light emits for compilation
@@ -112,4 +119,98 @@ func Diff(set AggregatedSet, loved DiffInputs) DiffPlan {
 		plan.ArtistsToAdd = append(plan.ArtistsToAdd, a)
 	}
 	return plan
+}
+
+// MetadataFetcher is the slice of internal/gateway.Client used by
+// CollapseCase1WithinPlaylist. Defined here to keep the playlistlove
+// dependency narrow.
+type MetadataFetcher interface {
+	GetAlbumMetadata(ctx context.Context, albumID string) (gateway.AlbumMetadata, error)
+}
+
+// CollapseCase1WithinPlaylist applies the lovedalbums Case-1 dedup rule to
+// the set's albums. For each conflict group (≥2 candidates sharing
+// (artist, normalised title)), it fetches metadata for every member, picks
+// the winner via lovedalbums.PickWinner, and drops the losers from
+// set.Albums. The number of dropped candidates is recorded in
+// Case1WithinPlaylistSuppressed.
+//
+// API cost is bounded by conflict-group membership, NOT by playlist size.
+// A typical playlist run hits zero or a handful of conflict groups.
+//
+// Metadata-fetch failures (e.g. ErrNotFound) drop the affected member from
+// the conflict group; the run continues. Auth failures bubble up.
+//
+// retry: nil → throttle.DefaultRetryBackoff; empty → first attempt only.
+func CollapseCase1WithinPlaylist(
+	ctx context.Context,
+	gw MetadataFetcher,
+	set AggregatedSet,
+	retry []time.Duration,
+) (AggregatedSet, error) {
+	type key struct{ artist, title string }
+	groups := make(map[key][]int)
+	for i, a := range set.Albums {
+		k := key{a.Artist, lovedalbums.Normalise(a.Title)}
+		groups[k] = append(groups[k], i)
+	}
+	drop := make(map[int]bool)
+	for _, indices := range groups {
+		if len(indices) < 2 {
+			continue
+		}
+		var members []gateway.AlbumMetadata
+		var memberIdx []int
+		for _, i := range indices {
+			if err := throttle.Sleep(ctx); err != nil {
+				return set, err
+			}
+			id := set.Albums[i].ID
+			var meta gateway.AlbumMetadata
+			callErr := throttle.RunOne(ctx, func(ctx context.Context) error {
+				var err error
+				meta, err = gw.GetAlbumMetadata(ctx, id)
+				return err
+			}, gateway.IsRetryable, retry)
+			if callErr == nil {
+				members = append(members, meta)
+				memberIdx = append(memberIdx, i)
+				continue
+			}
+			if errors.Is(callErr, context.Canceled) || errors.Is(callErr, context.DeadlineExceeded) {
+				return set, callErr
+			}
+			var ge *gateway.GatewayError
+			if errors.As(callErr, &ge) && ge.Kind == gateway.ErrAuthFailed {
+				return set, callErr
+			}
+			drop[i] = true
+		}
+		if len(members) < 2 {
+			continue
+		}
+		ranked := lovedalbums.PickWinner(members)
+		winnerID := ranked[0].ID
+		for j, m := range members {
+			if m.ID != winnerID {
+				drop[memberIdx[j]] = true
+			}
+		}
+	}
+	if len(drop) == 0 {
+		return set, nil
+	}
+	out := AggregatedSet{
+		UnparseableSongs:              set.UnparseableSongs,
+		VariousArtistsSkipped:         set.VariousArtistsSkipped,
+		Case1WithinPlaylistSuppressed: len(drop),
+		Artists:                       set.Artists,
+	}
+	for i, a := range set.Albums {
+		if drop[i] {
+			continue
+		}
+		out.Albums = append(out.Albums, a)
+	}
+	return out, nil
 }
