@@ -130,12 +130,19 @@ type MetadataFetcher interface {
 
 // CollapseCase1WithinPlaylist applies the lovedalbums Case-1 dedup rule to
 // the set's albums. For each conflict group (≥2 candidates sharing
-// (artist, normalised title)), it fetches metadata for every member, picks
-// the winner via lovedalbums.PickWinner, and drops the losers from
-// set.Albums. The number of dropped candidates is recorded in
-// Case1WithinPlaylistSuppressed.
+// (artist display name, normalised title)), it fetches metadata for every
+// member, then re-groups by (ArtistID, normalised title) — the same key
+// lovedalbums.DetectCase1 uses on the loved set — and runs PickWinner per
+// re-grouped subgroup. Losers are dropped from set.Albums.
 //
-// API cost is bounded by conflict-group membership, NOT by playlist size.
+// The two-pass keying matters: Album.Artist is the playlist's display name,
+// which can collide across distinct ArtistIDs (homonym artists) or vary
+// across rows for the same ArtistID. The first pass over display names is a
+// cheap pre-filter to avoid fetching metadata for every album; the second
+// pass uses the authoritative ArtistID so we never falsely group two
+// distinct artists.
+//
+// API cost is bounded by pre-filter membership, NOT by playlist size.
 // A typical playlist run hits zero or a handful of conflict groups.
 //
 // Metadata-fetch failures (e.g. ErrNotFound) drop the affected member from
@@ -148,19 +155,25 @@ func CollapseCase1WithinPlaylist(
 	set AggregatedSet,
 	retry []time.Duration,
 ) (AggregatedSet, error) {
-	type key struct{ artist, title string }
-	groups := make(map[key][]int)
+	type nameKey struct{ artistName, normTitle string }
+	prefilter := make(map[nameKey][]int)
 	for i, a := range set.Albums {
-		k := key{a.Artist, lovedalbums.Normalise(a.Title)}
-		groups[k] = append(groups[k], i)
+		k := nameKey{a.Artist, lovedalbums.Normalise(a.Title)}
+		prefilter[k] = append(prefilter[k], i)
 	}
 	drop := make(map[int]bool)
-	for _, indices := range groups {
+	type idKey struct{ artistID, normTitle string }
+	for _, indices := range prefilter {
 		if len(indices) < 2 {
 			continue
 		}
-		var members []gateway.AlbumMetadata
-		var memberIdx []int
+		// Fetch metadata for every pre-filter candidate, then re-group by
+		// the authoritative ArtistID before deciding losers.
+		type fetched struct {
+			meta gateway.AlbumMetadata
+			pos  int
+		}
+		var fetchedAll []fetched
 		for _, i := range indices {
 			if err := throttle.Sleep(ctx); err != nil {
 				return set, err
@@ -173,8 +186,7 @@ func CollapseCase1WithinPlaylist(
 				return err
 			}, gateway.IsRetryable, retry)
 			if callErr == nil {
-				members = append(members, meta)
-				memberIdx = append(memberIdx, i)
+				fetchedAll = append(fetchedAll, fetched{meta: meta, pos: i})
 				continue
 			}
 			if errors.Is(callErr, context.Canceled) || errors.Is(callErr, context.DeadlineExceeded) {
@@ -186,14 +198,26 @@ func CollapseCase1WithinPlaylist(
 			}
 			drop[i] = true
 		}
-		if len(members) < 2 {
-			continue
+
+		subgroups := make(map[idKey][]fetched)
+		for _, f := range fetchedAll {
+			k := idKey{f.meta.ArtistID, lovedalbums.Normalise(f.meta.Title)}
+			subgroups[k] = append(subgroups[k], f)
 		}
-		ranked := lovedalbums.PickWinner(members)
-		winnerID := ranked[0].ID
-		for j, m := range members {
-			if m.ID != winnerID {
-				drop[memberIdx[j]] = true
+		for _, sub := range subgroups {
+			if len(sub) < 2 {
+				continue
+			}
+			members := make([]gateway.AlbumMetadata, len(sub))
+			for j, f := range sub {
+				members[j] = f.meta
+			}
+			ranked := lovedalbums.PickWinner(members)
+			winnerID := ranked[0].ID
+			for _, f := range sub {
+				if f.meta.ID != winnerID {
+					drop[f.pos] = true
+				}
 			}
 		}
 	}

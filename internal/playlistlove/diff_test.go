@@ -187,6 +187,35 @@ func (e *errfulMeta) GetAlbumMetadata(ctx context.Context, id string) (gateway.A
 	return e.byID[id], nil
 }
 
+func TestCollapseCase1WithinPlaylist_distinctArtistIDsSameName_notFalselyGrouped(t *testing.T) {
+	// Two homonym artists with the same display name but different ArtistIDs.
+	// Pre-filter groups them (both share "Headphones" + normalised title), but
+	// the second-pass re-grouping by metadata.ArtistID must keep them apart so
+	// neither's album is suppressed.
+	set := AggregatedSet{
+		Albums: []Album{
+			{ID: "1", Title: "Self-Titled", Artist: "Headphones"},
+			{ID: "2", Title: "Self-Titled", Artist: "Headphones"},
+		},
+	}
+	gw := &fakeMeta{
+		byID: map[string]gateway.AlbumMetadata{
+			"1": {ID: "1", Title: "Self-Titled", ArtistID: "111", TrackCount: 10, FanCount: 100},
+			"2": {ID: "2", Title: "Self-Titled", ArtistID: "222", TrackCount: 10, FanCount: 100},
+		},
+	}
+	got, err := CollapseCase1WithinPlaylist(context.Background(), gw, set, nil)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if got.Case1WithinPlaylistSuppressed != 0 {
+		t.Errorf("suppressed = %d, want 0 (homonym artists must not be grouped)", got.Case1WithinPlaylistSuppressed)
+	}
+	if len(got.Albums) != 2 {
+		t.Errorf("len(Albums) = %d, want 2 (both albums survive)", len(got.Albums))
+	}
+}
+
 func TestCollapseCase1WithinPlaylist_metadataNotFound_dropsMember(t *testing.T) {
 	set := AggregatedSet{
 		Albums: []Album{
