@@ -117,6 +117,84 @@ func TestAddFavoriteAlbum_classifiedError(t *testing.T) {
 	}
 }
 
+func TestGetAlbumMetadata_success_mixedFormIDs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("method") {
+		case "deezer.getUserData":
+			w.Write([]byte(`{"results":{"checkForm":"tok","USER":{"USER_ID":42}}}`))
+		case "album.getData":
+			body, _ := readBody(r)
+			s := string(body)
+			if !strings.Contains(s, `"ALB_ID":"123"`) {
+				t.Errorf("expected ALB_ID=123 in body: %s", s)
+			}
+			// Mixed-form IDs in the SAME response — the gw-light-quirks
+			// learning says non-determinism shows up deep in pagination,
+			// so synthetic responses must mix forms within one payload.
+			w.Write([]byte(`{"results":{"ALB_ID":123,"ALB_TITLE":"Random Access Memories","ART_ID":"8537","ART_NAME":"Daft Punk","NB_FAN":"412000","NUMBER_TRACK":13}}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New("test-arl")
+	c.baseURL = srv.URL
+
+	got, err := c.GetAlbumMetadata(context.Background(), "123")
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	want := AlbumMetadata{
+		ID: "123", Title: "Random Access Memories",
+		ArtistID: "8537", ArtistName: "Daft Punk",
+		FanCount: 412000, TrackCount: 13,
+	}
+	if got != want {
+		t.Errorf("got = %+v, want %+v", got, want)
+	}
+}
+
+func TestGetAlbumMetadata_dataErrorMapsToNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("method") {
+		case "deezer.getUserData":
+			w.Write([]byte(`{"results":{"checkForm":"tok","USER":{"USER_ID":42}}}`))
+		case "album.getData":
+			w.Write([]byte(`{"error":{"DATA_ERROR":"album not found"}}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New("test-arl")
+	c.baseURL = srv.URL
+
+	_, err := c.GetAlbumMetadata(context.Background(), "999999")
+	var ge *GatewayError
+	if !asGatewayError(err, &ge) || ge.Kind != ErrNotFound {
+		t.Errorf("err = %v, want ErrNotFound via DATA_ERROR", err)
+	}
+}
+
+func TestGetAlbumMetadata_quotaErrorMapsToRateLimited(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("method") {
+		case "deezer.getUserData":
+			w.Write([]byte(`{"results":{"checkForm":"tok","USER":{"USER_ID":42}}}`))
+		case "album.getData":
+			w.Write([]byte(`{"error":{"QUOTA_ERROR":"Quota exceeded"}}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New("test-arl")
+	c.baseURL = srv.URL
+
+	_, err := c.GetAlbumMetadata(context.Background(), "123")
+	var ge *GatewayError
+	if !asGatewayError(err, &ge) || ge.Kind != ErrRateLimited {
+		t.Errorf("err = %v, want ErrRateLimited via QUOTA_ERROR", err)
+	}
+}
+
 // asGatewayError is a tiny helper bridging errors.As for terse tests.
 func asGatewayError(err error, target **GatewayError) bool {
 	for e := err; e != nil; {

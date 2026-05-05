@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 )
 
 const (
 	pageProfileMethod      = "deezer.pageProfile"
 	addFavoriteAlbumMethod = "album.addFavorite"
+	getAlbumMetadataMethod = "album.getData"
 	// pageProfileNb is the per-tab "give me everything" limit. The gateway is
 	// observed to honor large nb values and return a single page; if a real
 	// account hits truncation in the wild, switch to a smaller nb plus the
@@ -70,4 +72,65 @@ func (c *Client) AddFavoriteAlbum(ctx context.Context, albumID string) error {
 		return err
 	}
 	return nil
+}
+
+// AlbumMetadata is the lightweight album record used by lovedalbums dedup
+// and by playlistlove's within-playlist Case-1 pass.
+type AlbumMetadata struct {
+	ID         string
+	Title      string
+	ArtistID   string
+	ArtistName string
+	FanCount   int
+	TrackCount int
+}
+
+// albumMetadataRecord is the on-the-wire shape of one album record returned
+// by album.getData. All ID-shaped fields use flexString — gw-light returns
+// IDs in mixed quoted/numeric forms within a single response payload, see
+// docs/solutions/design-patterns/gw-light-go-adapter-quirks-2026-04-28.md.
+// FanCount and TrackCount are also flexString — d-fi-core types NUMBER_TRACK
+// inconsistently across two interfaces, the same precedent that triggered
+// flexString adoption for SNG_ID.
+type albumMetadataRecord struct {
+	ID         flexString `json:"ALB_ID"`
+	Title      string     `json:"ALB_TITLE"`
+	ArtistID   flexString `json:"ART_ID"`
+	ArtistName string     `json:"ART_NAME"`
+	FanCount   flexString `json:"NB_FAN"`
+	TrackCount flexString `json:"NUMBER_TRACK"`
+}
+
+// GetAlbumMetadata fetches one album's metadata via gw-light album.getData.
+// CSRF acquisition and refresh-on-expiry are handled by callWithCSRF.
+func (c *Client) GetAlbumMetadata(ctx context.Context, albumID string) (AlbumMetadata, error) {
+	body := map[string]any{"ALB_ID": albumID}
+	raw, err := c.callWithCSRF(ctx, getAlbumMetadataMethod, body)
+	if err != nil {
+		return AlbumMetadata{}, err
+	}
+	var rec albumMetadataRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		return AlbumMetadata{}, fmt.Errorf("decode %s: %w", getAlbumMetadataMethod, err)
+	}
+	fans, _ := parseFlexInt(rec.FanCount)
+	tracks, _ := parseFlexInt(rec.TrackCount)
+	return AlbumMetadata{
+		ID:         string(rec.ID),
+		Title:      rec.Title,
+		ArtistID:   string(rec.ArtistID),
+		ArtistName: rec.ArtistName,
+		FanCount:   fans,
+		TrackCount: tracks,
+	}, nil
+}
+
+// parseFlexInt parses a flexString that might be quoted or unquoted, and
+// might be empty. Returns 0, nil for empty input. Returns 0, err if the
+// content isn't a valid integer.
+func parseFlexInt(s flexString) (int, error) {
+	if s == "" {
+		return 0, nil
+	}
+	return strconv.Atoi(string(s))
 }
