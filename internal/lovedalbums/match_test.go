@@ -131,3 +131,148 @@ func ids(group []gateway.AlbumMetadata) []string {
 	sort.Strings(out)
 	return out
 }
+
+func TestDetectCase2_shortMatchesTrackOnLong(t *testing.T) {
+	post := []gateway.AlbumMetadata{
+		{ID: "S", Title: "Foo", ArtistID: "1", TrackCount: 1},
+		{ID: "L", Title: "Bar", ArtistID: "1", TrackCount: 12},
+	}
+	tracks := func(albumID string) ([]gateway.AlbumTrack, error) {
+		if albumID == "L" {
+			return []gateway.AlbumTrack{{ID: "t1", Title: "Foo"}, {ID: "t2", Title: "Other"}}, nil
+		}
+		t.Fatalf("unexpected ListTracks for %s", albumID)
+		return nil, nil
+	}
+	groups, err := DetectCase2(post, tracks, 3)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if len(groups) != 1 || groups[0].Parent.ID != "L" || len(groups[0].Shorts) != 1 || groups[0].Shorts[0].ID != "S" {
+		t.Errorf("groups = %+v", groups)
+	}
+}
+
+func TestDetectCase2_shortMustBeShorterThanThreshold(t *testing.T) {
+	post := []gateway.AlbumMetadata{
+		{ID: "S3", Title: "Foo", ArtistID: "1", TrackCount: 3},
+		{ID: "S4", Title: "Foo", ArtistID: "2", TrackCount: 4},
+		{ID: "L1", Title: "Bar", ArtistID: "1", TrackCount: 12},
+		{ID: "L2", Title: "Bar", ArtistID: "2", TrackCount: 12},
+	}
+	tracks := func(id string) ([]gateway.AlbumTrack, error) {
+		switch id {
+		case "L1":
+			return []gateway.AlbumTrack{{ID: "t", Title: "Foo"}}, nil
+		case "L2":
+			return []gateway.AlbumTrack{{ID: "t", Title: "Foo"}}, nil
+		}
+		t.Fatalf("unexpected: %s", id)
+		return nil, nil
+	}
+	groups, err := DetectCase2(post, tracks, 3)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if len(groups) != 1 || groups[0].Parent.ID != "L1" {
+		t.Errorf("expected one group on artist 1; got %+v", groups)
+	}
+}
+
+func TestDetectCase2_noMatchingTrack_noGroup(t *testing.T) {
+	post := []gateway.AlbumMetadata{
+		{ID: "S", Title: "Foo", ArtistID: "1", TrackCount: 1},
+		{ID: "L", Title: "Bar", ArtistID: "1", TrackCount: 12},
+	}
+	tracks := func(id string) ([]gateway.AlbumTrack, error) {
+		return []gateway.AlbumTrack{{ID: "t", Title: "Other"}}, nil
+	}
+	groups, err := DetectCase2(post, tracks, 3)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if len(groups) != 0 {
+		t.Errorf("groups = %+v, want empty", groups)
+	}
+}
+
+func TestDetectCase2_artistWithoutLong_noFetch(t *testing.T) {
+	post := []gateway.AlbumMetadata{
+		{ID: "S1", Title: "Foo", ArtistID: "1", TrackCount: 1},
+		{ID: "S2", Title: "Foo", ArtistID: "1", TrackCount: 2},
+	}
+	tracks := func(id string) ([]gateway.AlbumTrack, error) {
+		t.Fatalf("unexpected ListTracks for %s", id)
+		return nil, nil
+	}
+	groups, err := DetectCase2(post, tracks, 3)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if len(groups) != 0 {
+		t.Errorf("groups = %+v, want empty", groups)
+	}
+}
+
+func TestDetectCase2_multipleShortsCollapseOntoOneParent(t *testing.T) {
+	post := []gateway.AlbumMetadata{
+		{ID: "S1", Title: "Foo", ArtistID: "1", TrackCount: 1},
+		{ID: "S2", Title: "Bar", ArtistID: "1", TrackCount: 1},
+		{ID: "L", Title: "LP", ArtistID: "1", TrackCount: 12},
+	}
+	tracks := func(id string) ([]gateway.AlbumTrack, error) {
+		return []gateway.AlbumTrack{{Title: "Foo"}, {Title: "Bar"}}, nil
+	}
+	groups, err := DetectCase2(post, tracks, 3)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if len(groups) != 1 {
+		t.Fatalf("len = %d", len(groups))
+	}
+	got := ids(groups[0].Shorts)
+	if len(got) != 2 || got[0] != "S1" || got[1] != "S2" {
+		t.Errorf("shorts = %v", got)
+	}
+}
+
+func TestDetectCase2_multipleParents_lexSmallestNormalisedWins(t *testing.T) {
+	post := []gateway.AlbumMetadata{
+		{ID: "S", Title: "Foo", ArtistID: "1", TrackCount: 1},
+		{ID: "Lz", Title: "Zeta", ArtistID: "1", TrackCount: 12},
+		{ID: "La", Title: "Alpha", ArtistID: "1", TrackCount: 12},
+	}
+	tracks := func(id string) ([]gateway.AlbumTrack, error) {
+		return []gateway.AlbumTrack{{Title: "Foo"}}, nil
+	}
+	groups, err := DetectCase2(post, tracks, 3)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if len(groups) != 1 || groups[0].Parent.ID != "La" {
+		t.Errorf("parent = %+v, want La (lex-smallest normalised title)", groups[0].Parent)
+	}
+}
+
+func TestDetectCase2_tracklistError_dropsParentFromPool(t *testing.T) {
+	post := []gateway.AlbumMetadata{
+		{ID: "S", Title: "Foo", ArtistID: "1", TrackCount: 1},
+		{ID: "Lbad", Title: "Alpha", ArtistID: "1", TrackCount: 12},
+		{ID: "Lgood", Title: "Beta", ArtistID: "1", TrackCount: 12},
+	}
+	tracks := func(id string) ([]gateway.AlbumTrack, error) {
+		if id == "Lbad" {
+			return nil, errFakeNotFound
+		}
+		return []gateway.AlbumTrack{{Title: "Foo"}}, nil
+	}
+	groups, err := DetectCase2(post, tracks, 3)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if len(groups) != 1 || groups[0].Parent.ID != "Lgood" {
+		t.Errorf("parent = %+v, want Lgood (Lbad dropped due to fetch error)", groups[0].Parent)
+	}
+}
+
+var errFakeNotFound = &gateway.GatewayError{Kind: gateway.ErrNotFound, Message: "fake"}

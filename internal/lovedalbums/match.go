@@ -95,3 +95,121 @@ func DetectCase1(loved []gateway.AlbumMetadata) []Case1Group {
 	})
 	return out
 }
+
+// Case2Group is one short album (or several) by the same artist whose title
+// equals a track on a longer same-artist album that is also loved. Parent
+// stays loved; Shorts are losers to be un-loved.
+type Case2Group struct {
+	ArtistID   string
+	ArtistName string
+	Parent     gateway.AlbumMetadata
+	Shorts     []gateway.AlbumMetadata
+}
+
+// DetectCase2 returns Case-2 groups detected in the post-Case-1 loved set.
+//
+// "Post-Case-1" means the caller has already removed Case-1 losers from the
+// input slice. DetectCase2 does not re-run Case-1.
+//
+// fetchTracks is called once per long album of every phase-2-eligible artist
+// (artists with both at least one short and at least one long album in
+// post). On error, the album is dropped from the matching pool but detection
+// continues with the remaining albums.
+//
+// Threshold semantics: TrackCount ≤ threshold is "short"; > threshold is
+// "long". Threshold ≤ 0 falls back to the spec default of 3.
+func DetectCase2(
+	post []gateway.AlbumMetadata,
+	fetchTracks func(albumID string) ([]gateway.AlbumTrack, error),
+	threshold int,
+) ([]Case2Group, error) {
+	if threshold <= 0 {
+		threshold = 3
+	}
+
+	byArtist := make(map[string][]gateway.AlbumMetadata)
+	for _, a := range post {
+		byArtist[a.ArtistID] = append(byArtist[a.ArtistID], a)
+	}
+
+	artistIDs := make([]string, 0, len(byArtist))
+	for k := range byArtist {
+		artistIDs = append(artistIDs, k)
+	}
+	sort.Strings(artistIDs)
+
+	var groups []Case2Group
+	for _, aid := range artistIDs {
+		albums := byArtist[aid]
+		var shorts, longs []gateway.AlbumMetadata
+		for _, a := range albums {
+			if a.TrackCount <= threshold {
+				shorts = append(shorts, a)
+			} else {
+				longs = append(longs, a)
+			}
+		}
+		if len(shorts) == 0 || len(longs) == 0 {
+			continue
+		}
+
+		type longWithTracks struct {
+			meta   gateway.AlbumMetadata
+			titles map[string]bool
+		}
+		pool := make([]longWithTracks, 0, len(longs))
+		for _, l := range longs {
+			tracks, err := fetchTracks(l.ID)
+			if err != nil {
+				continue
+			}
+			titles := make(map[string]bool, len(tracks))
+			for _, t := range tracks {
+				titles[Normalise(t.Title)] = true
+			}
+			pool = append(pool, longWithTracks{meta: l, titles: titles})
+		}
+		if len(pool) == 0 {
+			continue
+		}
+
+		parentIdx := make(map[string]int)
+		artistName := albums[0].ArtistName
+		for _, s := range shorts {
+			n := Normalise(s.Title)
+			var picked *longWithTracks
+			pickedNormTitle := ""
+			for i := range pool {
+				if !pool[i].titles[n] {
+					continue
+				}
+				normTitle := Normalise(pool[i].meta.Title)
+				if picked == nil || normTitle < pickedNormTitle {
+					picked = &pool[i]
+					pickedNormTitle = normTitle
+				}
+			}
+			if picked == nil {
+				continue
+			}
+			if idx, ok := parentIdx[picked.meta.ID]; ok {
+				groups[idx].Shorts = append(groups[idx].Shorts, s)
+			} else {
+				parentIdx[picked.meta.ID] = len(groups)
+				groups = append(groups, Case2Group{
+					ArtistID:   aid,
+					ArtistName: artistName,
+					Parent:     picked.meta,
+					Shorts:     []gateway.AlbumMetadata{s},
+				})
+			}
+		}
+	}
+
+	for i := range groups {
+		sort.Slice(groups[i].Shorts, func(a, b int) bool {
+			return idLess(groups[i].Shorts[a].ID, groups[i].Shorts[b].ID)
+		})
+	}
+	return groups, nil
+}
