@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/niref/deezer-tools/internal/gateway"
+	"github.com/niref/deezer-tools/internal/throttle"
 )
 
 // ErrAborted is returned when the user declines the confirmation prompt.
@@ -210,7 +211,113 @@ func Run(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 		return res, nil
 	}
 
-	return res, errApplyNotImplemented
+	confirmReader := bufio.NewReader(opts.Stdin)
+	fmt.Fprintf(opts.Stdout, "Will unlove %d albums (%d case-1 dups, %d case-2 singles).\n",
+		res.AlbumsToUnlove, res.Case1Groups, res.Case2Groups)
+	fmt.Fprintf(opts.Stdout, "Run record: %s\n", recPath)
+	fmt.Fprint(opts.Stdout, "Type yes to apply: ")
+	ans, _ := confirmReader.ReadString('\n')
+	if !isYes(ans) {
+		fmt.Fprintln(opts.Stdout, "Aborted.")
+		res.Elapsed = time.Since(res.StartedAt)
+		return res, ErrAborted
+	}
+
+	skipLog, skipPath, err := openSkipLog(opts.BackupDir, recPath)
+	if err != nil {
+		return res, fmt.Errorf("open skip log: %w", err)
+	}
+	defer skipLog.Close()
+	res.SkipLogPath = skipPath
+
+	maxConsec := opts.MaxConsecutiveFinalFailures
+	if maxConsec == 0 {
+		maxConsec = throttle.DefaultMaxConsecutiveFinalFailures
+	}
+	streak := 0
+	for _, e := range plan.AlbumsToUnlove {
+		select {
+		case <-ctx.Done():
+			res.Elapsed = time.Since(res.StartedAt)
+			return res, ctx.Err()
+		default:
+		}
+		if err := throttle.Sleep(ctx); err != nil {
+			res.Elapsed = time.Since(res.StartedAt)
+			return res, err
+		}
+		albumID := e.Album.ID
+		callErr := throttle.RunOne(ctx, func(ctx context.Context) error {
+			return gw.RemoveFavoriteAlbum(ctx, albumID)
+		}, gateway.IsRetryable, opts.RetryBackoff)
+		if callErr == nil {
+			res.AlbumsUnloved++
+			streak = 0
+			continue
+		}
+		if errors.Is(callErr, context.Canceled) || errors.Is(callErr, context.DeadlineExceeded) {
+			res.Elapsed = time.Since(res.StartedAt)
+			return res, callErr
+		}
+		var ge *gateway.GatewayError
+		if errors.As(callErr, &ge) && ge.Kind == gateway.ErrAuthFailed {
+			res.Elapsed = time.Since(res.StartedAt)
+			return res, fmt.Errorf("auth failed during unlove (refresh your arl in ~/.config/deezer-tools/config.toml): %w", callErr)
+		}
+		res.AlbumsSkipped++
+		_ = writeSkipEntry(skipLog, e, callErr)
+		streak++
+		if maxConsec > 0 && streak >= maxConsec {
+			res.Elapsed = time.Since(res.StartedAt)
+			return res, fmt.Errorf("aborting: %d consecutive unlove failures (quota likely tripped or service degraded). Skipped items recorded in %s", streak, skipPath)
+		}
+	}
+
+	res.Elapsed = time.Since(res.StartedAt)
+	fmt.Fprintf(opts.Stdout, "Unloved %d albums (%d case-1, %d case-2), skipped %d",
+		res.AlbumsUnloved, res.Case1Groups, res.Case2Groups, res.AlbumsSkipped)
+	if res.AlbumsSkipped > 0 {
+		fmt.Fprintf(opts.Stdout, " (see %s)", skipPath)
+	}
+	fmt.Fprintf(opts.Stdout, ", elapsed %s\n", res.Elapsed.Round(time.Second))
+
+	if res.AlbumsSkipped > 0 {
+		return res, fmt.Errorf("%d album(s) skipped", res.AlbumsSkipped)
+	}
+	return res, nil
+}
+
+func isYes(s string) bool {
+	return strings.EqualFold(strings.TrimSpace(s), "yes")
+}
+
+func openSkipLog(dir, recordPath string) (io.WriteCloser, string, error) {
+	base := strings.TrimSuffix(filepath.Base(recordPath), ".json")
+	skipPath := filepath.Join(dir, base+".skip.log")
+	f, err := os.OpenFile(skipPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, "", err
+	}
+	return f, skipPath, nil
+}
+
+type skipEntry struct {
+	ID     string `json:"id"`
+	Title  string `json:"title,omitempty"`
+	Artist string `json:"artist,omitempty"`
+	Case   string `json:"case"`
+	Reason string `json:"reason,omitempty"`
+	Error  string `json:"error"`
+}
+
+func writeSkipEntry(w io.Writer, e UnloveEntry, err error) error {
+	rec := skipEntry{
+		ID: e.Album.ID, Title: e.Album.Title, Artist: e.Album.ArtistName,
+		Case: e.Case.String(), Reason: e.Reason, Error: err.Error(),
+	}
+	b, _ := json.Marshal(rec)
+	_, werr := fmt.Fprintln(w, string(b))
+	return werr
 }
 
 // errSkippedTracks is the sentinel that bridges Phase2Fetch's "no entry"
@@ -218,9 +325,6 @@ func Run(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 // any error as "drop this parent from the pool", which is the desired
 // behaviour for skipped fetches.
 var errSkippedTracks = errors.New("phase2: tracks unavailable")
-
-// errApplyNotImplemented is replaced wholesale by the apply phase in Task 13.
-var errApplyNotImplemented = errors.New("apply phase not yet implemented")
 
 func classifyAuth(err error, prefix string) error {
 	var ge *gateway.GatewayError
@@ -314,5 +418,3 @@ func writeRunRecord(dir string, started time.Time, rec runRecord) (string, error
 	return final, nil
 }
 
-// confirmReader is wired up in Task 13.
-var _ = bufio.NewReader
