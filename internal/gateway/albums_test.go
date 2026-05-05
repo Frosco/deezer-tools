@@ -153,6 +153,55 @@ func TestGetAlbumMetadata_success_mixedFormIDs(t *testing.T) {
 	}
 }
 
+func TestGetAlbumMetadata_missingOrNullNumericFieldsDecodeAsZero(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("method") {
+		case "deezer.getUserData":
+			w.Write([]byte(`{"results":{"checkForm":"tok","USER":{"USER_ID":42}}}`))
+		case "album.getData":
+			// NB_FAN absent, NUMBER_TRACK literal JSON null. Both should
+			// decode as 0 with no error — the orchestrator's PickWinner
+			// will still pick a winner via the lowest-ALB_ID tiebreaker.
+			w.Write([]byte(`{"results":{"ALB_ID":"123","ALB_TITLE":"X","ART_ID":"7","ART_NAME":"A","NUMBER_TRACK":null}}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New("test-arl")
+	c.baseURL = srv.URL
+
+	got, err := c.GetAlbumMetadata(context.Background(), "123")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got.FanCount != 0 || got.TrackCount != 0 {
+		t.Errorf("got FanCount=%d TrackCount=%d, want both 0", got.FanCount, got.TrackCount)
+	}
+}
+
+func TestGetAlbumMetadata_malformedNumericFieldPropagatesError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("method") {
+		case "deezer.getUserData":
+			w.Write([]byte(`{"results":{"checkForm":"tok","USER":{"USER_ID":42}}}`))
+		case "album.getData":
+			w.Write([]byte(`{"results":{"ALB_ID":"123","ALB_TITLE":"X","ART_ID":"7","ART_NAME":"A","NB_FAN":"412k","NUMBER_TRACK":13}}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New("test-arl")
+	c.baseURL = srv.URL
+
+	_, err := c.GetAlbumMetadata(context.Background(), "123")
+	if err == nil {
+		t.Fatal("err = nil, want parse error for NB_FAN=\"412k\"")
+	}
+	if !strings.Contains(err.Error(), "NB_FAN") {
+		t.Errorf("err = %v, want it to mention NB_FAN", err)
+	}
+}
+
 func TestGetAlbumMetadata_dataErrorMapsToNotFound(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Query().Get("method") {

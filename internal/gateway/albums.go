@@ -113,8 +113,14 @@ func (c *Client) GetAlbumMetadata(ctx context.Context, albumID string) (AlbumMet
 	if err := json.Unmarshal(raw, &rec); err != nil {
 		return AlbumMetadata{}, fmt.Errorf("decode %s: %w", getAlbumMetadataMethod, err)
 	}
-	fans, _ := parseFlexInt(rec.FanCount)
-	tracks, _ := parseFlexInt(rec.TrackCount)
+	fans, err := parseFlexInt(rec.FanCount)
+	if err != nil {
+		return AlbumMetadata{}, fmt.Errorf("decode %s NB_FAN %q: %w", getAlbumMetadataMethod, string(rec.FanCount), err)
+	}
+	tracks, err := parseFlexInt(rec.TrackCount)
+	if err != nil {
+		return AlbumMetadata{}, fmt.Errorf("decode %s NUMBER_TRACK %q: %w", getAlbumMetadataMethod, string(rec.TrackCount), err)
+	}
 	return AlbumMetadata{
 		ID:         string(rec.ID),
 		Title:      rec.Title,
@@ -125,11 +131,13 @@ func (c *Client) GetAlbumMetadata(ctx context.Context, albumID string) (AlbumMet
 	}, nil
 }
 
-// parseFlexInt parses a flexString that might be quoted or unquoted, and
-// might be empty. Returns 0, nil for empty input. Returns 0, err if the
-// content isn't a valid integer.
+// parseFlexInt parses a flexString that might arrive as a quoted string, a
+// bare JSON number, JSON null, or be absent. Returns 0, nil for empty/null
+// input (treated as "field missing or unset"). Returns 0, err if the content
+// is non-empty but not a valid integer — propagating lets PickWinner skip and
+// log the album rather than silently scoring it 0 on a tiebreaker dimension.
 func parseFlexInt(s flexString) (int, error) {
-	if s == "" {
+	if s == "" || string(s) == "null" {
 		return 0, nil
 	}
 	return strconv.Atoi(string(s))
