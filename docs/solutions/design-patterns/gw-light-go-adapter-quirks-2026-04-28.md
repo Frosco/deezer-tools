@@ -211,6 +211,7 @@ Mixing both shapes in a single response is what catches the bug. Two separate si
 
 ## Related
 
+- Sibling pattern doc: [docs/solutions/design-patterns/gw-light-favorites-naming-asymmetry-2026-04-30.md](./gw-light-favorites-naming-asymmetry-2026-04-30.md) — gw-light's asymmetric method names across favorites entity types (songs vs albums/artists/playlists). Same module, different facet of the same "gw-light isn't uniform" theme.
 - Spec: `docs/superpowers/specs/2026-04-27-wipe-loved-tracks-design.md` (on `main`)
 - Plan: `docs/superpowers/plans/2026-04-27-wipe-loved-tracks.md` (on `main`)
 - Protocol research: `docs/superpowers/research/2026-04-27-deezer-gateway-protocol.md` (on `main`)
