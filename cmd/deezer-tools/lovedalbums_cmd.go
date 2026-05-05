@@ -2,8 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io"
-	"os"
 
 	"github.com/niref/deezer-tools/internal/config"
 	"github.com/niref/deezer-tools/internal/gateway"
@@ -54,7 +52,6 @@ commands.`,
 				Stdin:               cmd.InOrStdin(),
 				Stdout:              cmd.OutOrStdout(),
 				Stderr:              cmd.ErrOrStderr(),
-				OpenTTY:             openLovedAlbumsTTY,
 			})
 			return err
 		},
@@ -64,10 +61,4 @@ commands.`,
 	cmd.Flags().StringVar(&backupDir, "backup-dir", ".", "directory for the run-record JSON and skip log")
 	cmd.Flags().IntVar(&threshold, "case2-track-threshold", 3, "albums with at most this many tracks count as 'short' for Case 2")
 	return cmd
-}
-
-// openLovedAlbumsTTY is unused by the current Options surface but kept in the
-// signature for parity with playlistlove and for future stdin-fed inputs.
-func openLovedAlbumsTTY() (io.ReadCloser, error) {
-	return os.OpenFile("/dev/tty", os.O_RDONLY, 0)
 }

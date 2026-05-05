@@ -44,7 +44,6 @@ type Options struct {
 	Case2TrackThreshold         int
 	RetryBackoff                []time.Duration
 	MaxConsecutiveFinalFailures int
-	OpenTTY                     func() (io.ReadCloser, error)
 }
 
 // Result summarizes a completed Run.
