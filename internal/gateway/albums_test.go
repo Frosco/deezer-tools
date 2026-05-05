@@ -298,6 +298,55 @@ func TestGetAlbumMetadata_quotaErrorMapsToRateLimited(t *testing.T) {
 	}
 }
 
+func TestRemoveFavoriteAlbum_success(t *testing.T) {
+	var seenALB string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("method") {
+		case "deezer.getUserData":
+			w.Write([]byte(`{"results":{"checkForm":"tok","USER":{"USER_ID":42}}}`))
+		case "album.deleteFavorite":
+			body, _ := readBody(r)
+			s := string(body)
+			if strings.Contains(s, `"ALB_ID":"123"`) {
+				seenALB = "123"
+			}
+			w.Write([]byte(`{"results":true}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New("test-arl")
+	c.baseURL = srv.URL
+
+	if err := c.RemoveFavoriteAlbum(context.Background(), "123"); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if seenALB != "123" {
+		t.Errorf("server did not see ALB_ID=123 (seen=%q)", seenALB)
+	}
+}
+
+func TestRemoveFavoriteAlbum_dataErrorMapsToNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("method") {
+		case "deezer.getUserData":
+			w.Write([]byte(`{"results":{"checkForm":"tok","USER":{"USER_ID":42}}}`))
+		case "album.deleteFavorite":
+			w.Write([]byte(`{"error":{"DATA_ERROR":"not in favorites"}}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New("test-arl")
+	c.baseURL = srv.URL
+
+	err := c.RemoveFavoriteAlbum(context.Background(), "999999")
+	var ge *GatewayError
+	if !asGatewayError(err, &ge) || ge.Kind != ErrNotFound {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
 // asGatewayError is a tiny helper bridging errors.As for terse tests.
 func asGatewayError(err error, target **GatewayError) bool {
 	for e := err; e != nil; {

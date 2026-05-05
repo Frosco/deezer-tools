@@ -8,9 +8,10 @@ import (
 )
 
 const (
-	pageProfileMethod      = "deezer.pageProfile"
-	addFavoriteAlbumMethod = "album.addFavorite"
-	getAlbumMetadataMethod = "album.getData"
+	pageProfileMethod         = "deezer.pageProfile"
+	addFavoriteAlbumMethod    = "album.addFavorite"
+	removeFavoriteAlbumMethod = "album.deleteFavorite"
+	getAlbumMetadataMethod    = "album.getData"
 	// listAlbumTracksMethod is in the song.* namespace, not album.*. Same
 	// kind of namespace-flip that bit us with album.getFavoriteIds (which
 	// doesn't exist; you use deezer.pageProfile). Verified in
@@ -74,6 +75,21 @@ func (c *Client) ListFavoriteAlbumIDs(ctx context.Context) ([]string, error) {
 func (c *Client) AddFavoriteAlbum(ctx context.Context, albumID string) error {
 	body := map[string]any{"ALB_ID": albumID}
 	if _, err := c.callWithCSRF(ctx, addFavoriteAlbumMethod, body); err != nil {
+		return err
+	}
+	return nil
+}
+
+// RemoveFavoriteAlbum un-loves the album with the given Deezer ALB_ID.
+// Symmetric with AddFavoriteAlbum (album.addFavorite). On already-unloved,
+// the wet-run-discovered classification is DATA_ERROR → ErrNotFound; callers
+// treat that as a one-shot skip (do NOT retry).
+//
+// CSRF acquisition and refresh are handled by callWithCSRF.
+// Returns *GatewayError on classified failure.
+func (c *Client) RemoveFavoriteAlbum(ctx context.Context, albumID string) error {
+	body := map[string]any{"ALB_ID": albumID}
+	if _, err := c.callWithCSRF(ctx, removeFavoriteAlbumMethod, body); err != nil {
 		return err
 	}
 	return nil
