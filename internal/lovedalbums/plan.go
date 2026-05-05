@@ -45,3 +45,80 @@ func idLess(a, b string) bool {
 	}
 	return a < b
 }
+
+// CaseKind identifies which detection rule produced an unlove entry.
+type CaseKind int
+
+const (
+	Case1 CaseKind = iota + 1
+	Case2
+)
+
+func (c CaseKind) String() string {
+	switch c {
+	case Case1:
+		return "case1"
+	case Case2:
+		return "case2"
+	}
+	return "unknown"
+}
+
+// UnloveEntry is one album scheduled to be un-loved, plus the rationale.
+type UnloveEntry struct {
+	Album  gateway.AlbumMetadata
+	Case   CaseKind
+	Reason string
+	// Parent is non-nil only for Case 2: the longer same-artist album whose
+	// tracklist contains a track named like Album.Title.
+	Parent *gateway.AlbumMetadata
+}
+
+// DedupePlan is the input to the apply phase. Case1Groups and Case2Groups
+// are kept around as-is for run-record reporting; AlbumsToUnlove is the
+// flattened, ALB_ID-deduped list the apply loop iterates over.
+type DedupePlan struct {
+	Case1Groups    []Case1Group
+	Case2Groups    []Case2Group
+	AlbumsToUnlove []UnloveEntry
+}
+
+// BuildPlan flattens Case-1 losers + Case-2 shorts into a single
+// AlbumsToUnlove slice, deduped by ALB_ID. Order is deterministic: Case-1
+// entries first (in group order), then Case-2 entries.
+//
+// Caller invariant: c2 was computed on the post-Case-1 set, so an album
+// cannot be both a Case-1 loser and a Case-2 short (see the design spec).
+// The dedup-by-ALB_ID step here is defence-in-depth, not a workaround.
+func BuildPlan(c1 []Case1Group, c2 []Case2Group) DedupePlan {
+	plan := DedupePlan{Case1Groups: c1, Case2Groups: c2}
+	seen := make(map[string]bool)
+	add := func(e UnloveEntry) {
+		if seen[e.Album.ID] {
+			return
+		}
+		seen[e.Album.ID] = true
+		plan.AlbumsToUnlove = append(plan.AlbumsToUnlove, e)
+	}
+	for _, g := range c1 {
+		for _, m := range g.Members[1:] {
+			add(UnloveEntry{
+				Album:  m,
+				Case:   Case1,
+				Reason: "same normalised title as " + g.Members[0].Title,
+			})
+		}
+	}
+	for _, g := range c2 {
+		parent := g.Parent
+		for _, s := range g.Shorts {
+			add(UnloveEntry{
+				Album:  s,
+				Case:   Case2,
+				Reason: "single matches a track on " + parent.Title,
+				Parent: &parent,
+			})
+		}
+	}
+	return plan
+}

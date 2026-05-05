@@ -67,3 +67,81 @@ func TestPickWinner_returnsAllInOrder(t *testing.T) {
 		t.Errorf("order = [%s %s %s], want [A C B]", got[0].ID, got[1].ID, got[2].ID)
 	}
 }
+
+func TestBuildPlan_combinesCase1AndCase2_disjoint(t *testing.T) {
+	c1 := []Case1Group{
+		{
+			ArtistID: "1", ArtistName: "A", NormalisedKey: "x",
+			Members: []gateway.AlbumMetadata{
+				{ID: "winner1", Title: "X"}, {ID: "loser1", Title: "X"},
+			},
+		},
+	}
+	c2 := []Case2Group{
+		{
+			ArtistID: "1", ArtistName: "A",
+			Parent: gateway.AlbumMetadata{ID: "parent2", Title: "LP"},
+			Shorts: []gateway.AlbumMetadata{{ID: "short2", Title: "Foo"}},
+		},
+	}
+	plan := BuildPlan(c1, c2)
+	if len(plan.AlbumsToUnlove) != 2 {
+		t.Fatalf("AlbumsToUnlove = %d, want 2", len(plan.AlbumsToUnlove))
+	}
+	got := plan.AlbumsToUnlove
+	if got[0].Album.ID != "loser1" || got[0].Case != Case1 {
+		t.Errorf("got[0] = %+v", got[0])
+	}
+	if got[1].Album.ID != "short2" || got[1].Case != Case2 {
+		t.Errorf("got[1] = %+v", got[1])
+	}
+	if got[1].Parent == nil || got[1].Parent.ID != "parent2" {
+		t.Errorf("got[1].Parent = %+v, want parent2", got[1].Parent)
+	}
+}
+
+func TestBuildPlan_winnersAndParentsNotUnloved(t *testing.T) {
+	c1 := []Case1Group{
+		{
+			Members: []gateway.AlbumMetadata{
+				{ID: "winner"}, {ID: "loser"},
+			},
+		},
+	}
+	c2 := []Case2Group{
+		{
+			Parent: gateway.AlbumMetadata{ID: "parent"},
+			Shorts: []gateway.AlbumMetadata{{ID: "short"}},
+		},
+	}
+	plan := BuildPlan(c1, c2)
+	for _, e := range plan.AlbumsToUnlove {
+		if e.Album.ID == "winner" || e.Album.ID == "parent" {
+			t.Errorf("unexpected unlove: %s", e.Album.ID)
+		}
+	}
+}
+
+func TestBuildPlan_dedupesByALBID(t *testing.T) {
+	c1 := []Case1Group{
+		{Members: []gateway.AlbumMetadata{{ID: "w1"}, {ID: "dup"}}},
+		{Members: []gateway.AlbumMetadata{{ID: "w2"}, {ID: "dup"}}},
+	}
+	plan := BuildPlan(c1, nil)
+	count := 0
+	for _, e := range plan.AlbumsToUnlove {
+		if e.Album.ID == "dup" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("dup count = %d, want 1", count)
+	}
+}
+
+func TestBuildPlan_emptyInputs_emptyPlan(t *testing.T) {
+	plan := BuildPlan(nil, nil)
+	if len(plan.AlbumsToUnlove) != 0 || len(plan.Case1Groups) != 0 || len(plan.Case2Groups) != 0 {
+		t.Errorf("plan = %+v", plan)
+	}
+}
