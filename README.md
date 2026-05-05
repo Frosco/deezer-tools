@@ -82,3 +82,30 @@ Sequential paced writes (1s ± 200ms between attempts, 5s/15s/30s/60s/120s
 retry on rate-limit/5xx) protect against the gw-light quota that
 historically tripped Akamai's WAF on the wipe — see
 `docs/solutions/integration-issues/`.
+
+### `loved-albums dedupe`
+
+Find and remove duplicate entries in your loved-albums list:
+
+- **Case 1** — same artist, same normalised title, different ALB_IDs. Picks
+  the album with most tracks → most fans → lowest ID; un-loves the rest.
+- **Case 2** — a short loved album (default ≤3 tracks) whose title equals a
+  track on a longer same-artist album that's also loved. Un-loves the short
+  one; the longer album stays loved.
+
+```sh
+deezer-tools loved-albums dedupe --dry-run            # detect, write report, do not unlove
+deezer-tools loved-albums dedupe --backup-dir ./out   # write run record + skip log to ./out
+deezer-tools loved-albums dedupe --case2-track-threshold 5
+```
+
+After detection a run record is written to
+`<backup-dir>/deezer-loved-albums-dedupe-<UTC>.json`. After a single batched
+confirmation, losers are un-loved with the same paced-throttle / retry /
+circuit-breaker discipline as `loved-tracks wipe` and `playlists love-contents`.
+Run record and skip log are gitignored.
+
+`playlists love-contents` also gains a within-playlist Case-1 collapse: when
+two songs in the source playlist resolve to different ALB_IDs for the same
+album, only the canonical edition is loved. Across-playlist Case-1 dedup is
+left to the standalone `loved-albums dedupe` command.
