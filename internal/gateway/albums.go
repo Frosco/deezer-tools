@@ -11,6 +11,11 @@ const (
 	pageProfileMethod      = "deezer.pageProfile"
 	addFavoriteAlbumMethod = "album.addFavorite"
 	getAlbumMetadataMethod = "album.getData"
+	// listAlbumTracksMethod is in the song.* namespace, not album.*. Same
+	// kind of namespace-flip that bit us with album.getFavoriteIds (which
+	// doesn't exist; you use deezer.pageProfile). Verified in
+	// docs/superpowers/research/2026-05-05-deezer-album-protocol.md.
+	listAlbumTracksMethod = "song.getListByAlbum"
 	// pageProfileNb is the per-tab "give me everything" limit. The gateway is
 	// observed to honor large nb values and return a single page; if a real
 	// account hits truncation in the wild, switch to a smaller nb plus the
@@ -141,4 +146,41 @@ func parseFlexInt(s flexString) (int, error) {
 		return 0, nil
 	}
 	return strconv.Atoi(string(s))
+}
+
+// AlbumTrack is one track on an album, used for Case-2 detection.
+type AlbumTrack struct {
+	ID    string
+	Title string
+}
+
+type albumTrackRecord struct {
+	ID    flexString `json:"SNG_ID"`
+	Title string     `json:"SNG_TITLE"`
+}
+
+// ListAlbumTracks returns the tracks on one album. Used only in phase 2 of
+// loved-albums dedup.
+//
+// gw-light's song.getListByAlbum returns all tracks in a single call when
+// passed nb=-1 (the convention across deemix/deezer-py/d-fi-core/RedSea). If
+// a wet run surfaces pagination, switch to a start/nb loop following
+// ListFavoriteSongs's stage-1 shape.
+func (c *Client) ListAlbumTracks(ctx context.Context, albumID string) ([]AlbumTrack, error) {
+	body := map[string]any{"ALB_ID": albumID, "nb": -1}
+	raw, err := c.callWithCSRF(ctx, listAlbumTracksMethod, body)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Data []albumTrackRecord `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", listAlbumTracksMethod, err)
+	}
+	out := make([]AlbumTrack, 0, len(resp.Data))
+	for _, r := range resp.Data {
+		out = append(out, AlbumTrack{ID: string(r.ID), Title: r.Title})
+	}
+	return out, nil
 }
