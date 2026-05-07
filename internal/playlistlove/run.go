@@ -288,9 +288,11 @@ func Run(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 // shared between Run (full pipeline) and ApplyFromRecord (replay from an
 // edited record file).
 //
-// recordPath is used only to derive the skip-log path. albums and artists are
-// the already-filtered, already-deduped slices to apply. res is mutated in
-// place — AddedAlbums, AddedArtists, SkippedItems, SkipLogPath, Elapsed.
+// opts.SkipLogBaseName determines the skip-log filename; the caller is
+// responsible for deriving it from a record path or any other source. albums
+// and artists are the already-filtered, already-deduped slices to apply. res
+// is mutated in place — AddedAlbums, AddedArtists, SkippedItems, SkipLogPath,
+// Elapsed.
 //
 // Returns the same errors as before: ErrAuthFailed wrapped with the refresh-
 // arl message, the streak-breaker error, ctx.Err() on cancel, or a
