@@ -165,6 +165,21 @@ func defaultApplyOpts(stdin string, dir string, rec *RunRecord) ApplyOptions {
 	}
 }
 
+func TestApplyFromRecord_nilRecord(t *testing.T) {
+	opts := ApplyOptions{
+		Stdin:  strings.NewReader(""),
+		Stdout: &bytes.Buffer{},
+		Stderr: &bytes.Buffer{},
+	}
+	_, err := ApplyFromRecord(context.Background(), &fakeGateway{}, opts)
+	if err == nil {
+		t.Fatal("err = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "Record must not be nil") {
+		t.Errorf("err = %v, want message about nil Record", err)
+	}
+}
+
 func TestApplyFromRecord_happyPath(t *testing.T) {
 	dir := t.TempDir()
 	rec := &RunRecord{
@@ -186,7 +201,7 @@ func TestApplyFromRecord_happyPath(t *testing.T) {
 	if res.AddedArtists != 1 {
 		t.Errorf("AddedArtists = %d, want 1", res.AddedArtists)
 	}
-	if got := append([]string{}, gw.addedAlbums...); len(got) != 2 || got[0] != "100" || got[1] != "101" {
+	if got := gw.addedAlbums; len(got) != 2 || got[0] != "100" || got[1] != "101" {
 		t.Errorf("addedAlbums = %v", gw.addedAlbums)
 	}
 	if got := gw.addedArtists; len(got) != 1 || got[0] != "10" {

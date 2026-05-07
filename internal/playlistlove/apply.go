@@ -74,6 +74,8 @@ func LoadRunRecord(path string) (*RunRecord, error) {
 //
 // RecordPath is optional. When empty, stdout uses "(in-memory record)" and the
 // skip-log basename uses "deezer-playlist-love-replay".
+//
+// BackupDir defaults to "." when empty.
 type ApplyOptions struct {
 	Record                      *RunRecord
 	RecordPath                  string
@@ -86,8 +88,11 @@ type ApplyOptions struct {
 	MaxConsecutiveFinalFailures int
 }
 
-// ApplyFromRecord applies a previously generated RunRecord: it filters already-
-// loved items, deduplicates, confirms with the user, then calls applyPlan.
+// ApplyFromRecord applies a previously generated RunRecord. It re-fetches the
+// current loved albums and loved artists immediately before applying, silently
+// skips items already loved (defense against between-runs drift and hand-edit
+// duplicates), confirms with the user unless AssumeYes, then calls applyPlan.
+// No new run-record file is written — the input record is the audit trail.
 func ApplyFromRecord(ctx context.Context, gw Gateway, opts ApplyOptions) (*Result, error) {
 	if opts.Record == nil {
 		return nil, errors.New("playlistlove: ApplyOptions.Record must not be nil")
