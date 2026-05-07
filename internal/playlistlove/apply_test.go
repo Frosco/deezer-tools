@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/niref/deezer-tools/internal/gateway"
 )
 
 func writeRecordFile(t *testing.T, dir string, body string) string {
@@ -367,5 +369,144 @@ func TestApplyFromRecord_assumeYesSkipsPrompt(t *testing.T) {
 	}
 	if res.AddedAlbums != 1 {
 		t.Errorf("AddedAlbums = %d, want 1", res.AddedAlbums)
+	}
+}
+
+func TestApplyFromRecord_authFailureDuringApplyAborts(t *testing.T) {
+	dir := t.TempDir()
+	rec := &RunRecord{
+		Version:     1,
+		AlbumsToAdd: []RecordAlbum{{ID: "100"}},
+	}
+	gw := &fakeGateway{
+		addAlbumErrs: map[string]error{
+			"100": &gateway.GatewayError{Kind: gateway.ErrAuthFailed, Method: "album.addFavorite", Message: "USER_AUTH_REQUIRED"},
+		},
+	}
+	_, err := ApplyFromRecord(context.Background(), gw, defaultApplyOpts("yes\n", dir, rec))
+	if err == nil || !strings.Contains(err.Error(), "auth failed") {
+		t.Fatalf("err = %v, want auth-failed wrapped", err)
+	}
+}
+
+func TestApplyFromRecord_streakBreakerTrips(t *testing.T) {
+	dir := t.TempDir()
+	transient := &gateway.GatewayError{Kind: gateway.ErrServerError, Method: "album.addFavorite", Message: "500"}
+	rec := &RunRecord{
+		Version: 1,
+		AlbumsToAdd: []RecordAlbum{
+			{ID: "100"}, {ID: "101"}, {ID: "102"}, {ID: "103"},
+		},
+	}
+	gw := &fakeGateway{
+		addAlbumErrs: map[string]error{
+			"100": transient, "101": transient, "102": transient, "103": transient,
+		},
+	}
+	opts := defaultApplyOpts("yes\n", dir, rec)
+	opts.MaxConsecutiveFinalFailures = 2
+
+	_, err := ApplyFromRecord(context.Background(), gw, opts)
+	if err == nil || !strings.Contains(err.Error(), "consecutive") {
+		t.Fatalf("err = %v, want breaker abort", err)
+	}
+	if len(gw.addedAlbums) != 0 {
+		t.Errorf("addedAlbums = %v, want 0", gw.addedAlbums)
+	}
+}
+
+func TestApplyFromRecord_contextCancellation(t *testing.T) {
+	dir := t.TempDir()
+	rec := &RunRecord{
+		Version: 1,
+		AlbumsToAdd: []RecordAlbum{
+			{ID: "100"}, {ID: "101"},
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	gw := &cancellingGateway{
+		fakeGateway: &fakeGateway{},
+		cancel:      cancel,
+	}
+	_, err := ApplyFromRecord(ctx, gw, defaultApplyOpts("yes\n", dir, rec))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if len(gw.addedAlbums) != 1 {
+		t.Errorf("addedAlbums = %v, want exactly 1 (the first one)", gw.addedAlbums)
+	}
+}
+
+// cancellingGateway is a fakeGateway that cancels its supplied context on
+// the first successful AddFavoriteAlbum call, so the next loop iteration
+// observes ctx.Err().
+type cancellingGateway struct {
+	*fakeGateway
+	cancel context.CancelFunc
+	hit    bool
+}
+
+func (c *cancellingGateway) AddFavoriteAlbum(ctx context.Context, id string) error {
+	if err := c.fakeGateway.AddFavoriteAlbum(ctx, id); err != nil {
+		return err
+	}
+	if !c.hit {
+		c.hit = true
+		c.cancel()
+	}
+	return nil
+}
+
+func TestApplyFromRecord_skipLogPath(t *testing.T) {
+	dir := t.TempDir()
+	rec := &RunRecord{
+		Version:     1,
+		AlbumsToAdd: []RecordAlbum{{ID: "100"}, {ID: "101"}},
+	}
+	gw := &fakeGateway{
+		addAlbumErrs: map[string]error{
+			"101": &gateway.GatewayError{Kind: gateway.ErrNotFound, Method: "album.addFavorite", Message: "DATA_ERROR"},
+		},
+	}
+	opts := defaultApplyOpts("yes\n", dir, rec)
+	opts.RecordPath = filepath.Join(dir, "deezer-playlist-love-20260507T120000Z.json")
+
+	res, err := ApplyFromRecord(context.Background(), gw, opts)
+	if err == nil {
+		t.Fatal("err = nil, want non-nil due to skip")
+	}
+	if res.SkipLogPath == "" {
+		t.Fatal("SkipLogPath empty")
+	}
+	wantPrefix := filepath.Join(dir, "deezer-playlist-love-20260507T120000Z.applied-")
+	if !strings.HasPrefix(res.SkipLogPath, wantPrefix) {
+		t.Errorf("SkipLogPath = %q, want prefix %q", res.SkipLogPath, wantPrefix)
+	}
+	if !strings.HasSuffix(res.SkipLogPath, ".skip.log") {
+		t.Errorf("SkipLogPath = %q, want .skip.log suffix", res.SkipLogPath)
+	}
+	if _, statErr := os.Stat(res.SkipLogPath); statErr != nil {
+		t.Errorf("skip log not written: %v", statErr)
+	}
+}
+
+func TestApplyFromRecord_noSecondRunRecord(t *testing.T) {
+	dir := t.TempDir()
+	rec := &RunRecord{
+		Version:     1,
+		AlbumsToAdd: []RecordAlbum{{ID: "100"}},
+	}
+	gw := &fakeGateway{}
+	res, err := ApplyFromRecord(context.Background(), gw, defaultApplyOpts("yes\n", dir, rec))
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if res.RunRecordPath != "" {
+		t.Errorf("RunRecordPath = %q, want empty", res.RunRecordPath)
+	}
+	matches, _ := filepath.Glob(filepath.Join(dir, "*.json"))
+	if len(matches) != 0 {
+		t.Errorf("backup dir contains json files after apply: %v", matches)
 	}
 }
