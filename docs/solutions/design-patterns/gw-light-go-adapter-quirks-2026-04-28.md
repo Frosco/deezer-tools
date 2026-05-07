@@ -1,6 +1,7 @@
 ---
 title: gw-light Go adapter quirks - cookie jar and flexString
 date: 2026-04-28
+last_refreshed: 2026-05-07
 category: design-patterns
 module: deezer-tools
 problem_type: design_pattern
@@ -97,6 +98,35 @@ Single-type fixtures will mask heterogeneity bugs.
 ### 5. Don't trust analogy when extending a fix
 
 When a typing fix is applied to one field, audit all sibling fields in the same response for the same wire characteristics. The protocol research doc on `main` correctly listed `SNG_ID/USER_ID/total` as varying types, but the `json.Number` fix only worked for the bare-number cases - `SNG_ID` arrived as both forms and needed a different mechanism. Every "JSON typing varies" remediation must enumerate all affected fields in one pass.
+
+### 6. When converting flexString to a non-string type, distinguish missing from malformed
+
+`flexString` is correct as a permissive *decoder* — it gets bytes off the wire without crashing. But "we got bytes off the wire" is not the same as "we got a meaningful value." Any helper that converts `flexString` to a numeric type (or any other domain type) is the seam where bytes become semantic values, and it must explicitly distinguish:
+
+- **Field missing or explicitly null** — gateway is telling us "no value here." Map to the type's zero default with no error: this is the legitimate "unset" case.
+- **Field present but unparseable** — gateway returned bytes we did not expect (`"412k"`, a stringified float, an unknown sentinel). The zero default here is **not** meaningful; it is a fabricated reading. Return an error.
+
+If the helper collapses both cases into the same zero-with-no-error, the call site cannot distinguish them — and any downstream consumer that uses the value as a sort key, a comparison key, or a destructive-action input will silently corrupt user data.
+
+The risk is not theoretical: see [docs/solutions/logic-errors/parseflexint-swallowed-error-album-dedupe-2026-05-07.md](../logic-errors/parseflexint-swallowed-error-album-dedupe-2026-05-07.md) for a real case where `parseFlexInt` (the integer-typed cousin of `flexString`) was wired into the album metadata struct with `_` for the error return on `NB_FAN` and `NUMBER_TRACK`. A null or malformed value would have silently scored albums as 0-fans/0-tracks, causing the dedup orchestrator to un-love the wrong canonical edition.
+
+The contract that worked:
+
+```go
+// parseFlexInt parses a flexString that might arrive as a quoted string, a
+// bare JSON number, JSON null, or be absent. Returns 0, nil for empty/null
+// input (treated as "field missing or unset"). Returns 0, err if the content
+// is non-empty but not a valid integer — propagating lets the caller skip
+// and log the record rather than silently scoring it 0 on a sort key.
+func parseFlexInt(s flexString) (int, error) {
+    if s == "" || string(s) == "null" {
+        return 0, nil
+    }
+    return strconv.Atoi(string(s))
+}
+```
+
+Two tests pin the contract: one that exercises the empty/null path (asserts zero with no error) and one that exercises the malformed path (asserts a wrapped error mentioning the field name). Reviewing a `_ :=` discard on a parse return is the cheapest way to catch this class of bug.
 
 ## Why This Matters
 
@@ -212,6 +242,7 @@ Mixing both shapes in a single response is what catches the bug. Two separate si
 ## Related
 
 - Sibling pattern doc: [docs/solutions/design-patterns/gw-light-favorites-naming-asymmetry-2026-04-30.md](./gw-light-favorites-naming-asymmetry-2026-04-30.md) — gw-light's asymmetric method names across favorites entity types (songs vs albums/artists/playlists). Same module, different facet of the same "gw-light isn't uniform" theme.
+- Concrete case for guidance #6: [docs/solutions/logic-errors/parseflexint-swallowed-error-album-dedupe-2026-05-07.md](../logic-errors/parseflexint-swallowed-error-album-dedupe-2026-05-07.md) — a real silent-zero-coercion bug class on `NB_FAN` / `NUMBER_TRACK` that motivated the flex-decoder semantics rule.
 - Spec: `docs/superpowers/specs/2026-04-27-wipe-loved-tracks-design.md` (on `main`)
 - Plan: `docs/superpowers/plans/2026-04-27-wipe-loved-tracks.md` (on `main`)
 - Protocol research: `docs/superpowers/research/2026-04-27-deezer-gateway-protocol.md` (on `main`)
