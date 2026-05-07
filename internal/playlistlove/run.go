@@ -65,23 +65,23 @@ type Result struct {
 	Elapsed         time.Duration
 }
 
-// runRecord is the JSON payload written to <BackupDir>/deezer-playlist-love-<UTC>.json.
-type runRecord struct {
+// RunRecord is the JSON payload written to <BackupDir>/deezer-playlist-love-<UTC>.json.
+type RunRecord struct {
 	Version         int              `json:"version"`
 	StartedAt       string           `json:"started_at"`
-	SourcePlaylists []recordPlaylist `json:"source_playlists"`
-	Stats           runRecordStats   `json:"stats"`
-	AlbumsToAdd     []recordAlbum    `json:"albums_to_add"`
-	ArtistsToAdd    []recordArtist   `json:"artists_to_add"`
+	SourcePlaylists []RecordPlaylist `json:"source_playlists"`
+	Stats           RunRecordStats   `json:"stats"`
+	AlbumsToAdd     []RecordAlbum    `json:"albums_to_add"`
+	ArtistsToAdd    []RecordArtist   `json:"artists_to_add"`
 }
 
-type recordPlaylist struct {
+type RecordPlaylist struct {
 	Input      string `json:"input"`
 	PlaylistID string `json:"playlist_id"`
 	SongCount  int    `json:"song_count"`
 }
 
-type runRecordStats struct {
+type RunRecordStats struct {
 	SongsScanned                  int `json:"songs_scanned"`
 	PlaylistsLoaded               int `json:"playlists_loaded"`
 	PlaylistsFailed               int `json:"playlists_failed"`
@@ -96,13 +96,13 @@ type runRecordStats struct {
 	ArtistsToAdd                  int `json:"artists_to_add"`
 }
 
-type recordAlbum struct {
+type RecordAlbum struct {
 	ID     string `json:"id"`
 	Title  string `json:"title"`
 	Artist string `json:"artist"`
 }
 
-type recordArtist struct {
+type RecordArtist struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 }
@@ -146,7 +146,7 @@ func Run(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 
 	// 2. Load each playlist.
 	var allSongs []gateway.PlaylistSong
-	var sourcePlaylists []recordPlaylist
+	var sourcePlaylists []RecordPlaylist
 	var loadFailures []InputError
 	for _, in := range good {
 		songs, err := gw.ListPlaylistSongs(ctx, in.PlaylistID, opts.PageSize)
@@ -160,7 +160,7 @@ func Run(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 			continue
 		}
 		allSongs = append(allSongs, songs...)
-		sourcePlaylists = append(sourcePlaylists, recordPlaylist{
+		sourcePlaylists = append(sourcePlaylists, RecordPlaylist{
 			Input: in.Raw, PlaylistID: in.PlaylistID, SongCount: len(songs),
 		})
 		res.PlaylistsLoaded++
@@ -205,11 +205,11 @@ func Run(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 	plan := Diff(set, DiffInputs{LovedAlbumIDs: lovedAlbums, LovedArtistIDs: lovedArtists})
 
 	// 7. Run-record.
-	rec := runRecord{
+	rec := RunRecord{
 		Version:         1,
 		StartedAt:       res.StartedAt.Format(time.RFC3339),
 		SourcePlaylists: sourcePlaylists,
-		Stats: runRecordStats{
+		Stats: RunRecordStats{
 			SongsScanned:                  len(allSongs),
 			PlaylistsLoaded:               res.PlaylistsLoaded,
 			PlaylistsFailed:               res.PlaylistsFailed,
@@ -225,10 +225,10 @@ func Run(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 		},
 	}
 	for _, a := range plan.AlbumsToAdd {
-		rec.AlbumsToAdd = append(rec.AlbumsToAdd, recordAlbum{ID: a.ID, Title: a.Title, Artist: a.Artist})
+		rec.AlbumsToAdd = append(rec.AlbumsToAdd, RecordAlbum{ID: a.ID, Title: a.Title, Artist: a.Artist})
 	}
 	for _, a := range plan.ArtistsToAdd {
-		rec.ArtistsToAdd = append(rec.ArtistsToAdd, recordArtist{ID: a.ID, Name: a.Name})
+		rec.ArtistsToAdd = append(rec.ArtistsToAdd, RecordArtist{ID: a.ID, Name: a.Name})
 	}
 	recordPath, err := writeRunRecord(opts.BackupDir, res.StartedAt, rec)
 	if err != nil {
@@ -370,7 +370,7 @@ func isYes(s string) bool {
 	return strings.EqualFold(strings.TrimSpace(s), "yes")
 }
 
-func writeRunRecord(dir string, started time.Time, rec runRecord) (string, error) {
+func writeRunRecord(dir string, started time.Time, rec RunRecord) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
