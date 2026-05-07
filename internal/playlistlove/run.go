@@ -65,23 +65,23 @@ type Result struct {
 	Elapsed         time.Duration
 }
 
-// runRecord is the JSON payload written to <BackupDir>/deezer-playlist-love-<UTC>.json.
-type runRecord struct {
+// RunRecord is the JSON payload written to <BackupDir>/deezer-playlist-love-<UTC>.json.
+type RunRecord struct {
 	Version         int              `json:"version"`
 	StartedAt       string           `json:"started_at"`
-	SourcePlaylists []recordPlaylist `json:"source_playlists"`
-	Stats           runRecordStats   `json:"stats"`
-	AlbumsToAdd     []recordAlbum    `json:"albums_to_add"`
-	ArtistsToAdd    []recordArtist   `json:"artists_to_add"`
+	SourcePlaylists []RecordPlaylist `json:"source_playlists"`
+	Stats           RunRecordStats   `json:"stats"`
+	AlbumsToAdd     []RecordAlbum    `json:"albums_to_add"`
+	ArtistsToAdd    []RecordArtist   `json:"artists_to_add"`
 }
 
-type recordPlaylist struct {
+type RecordPlaylist struct {
 	Input      string `json:"input"`
 	PlaylistID string `json:"playlist_id"`
 	SongCount  int    `json:"song_count"`
 }
 
-type runRecordStats struct {
+type RunRecordStats struct {
 	SongsScanned                  int `json:"songs_scanned"`
 	PlaylistsLoaded               int `json:"playlists_loaded"`
 	PlaylistsFailed               int `json:"playlists_failed"`
@@ -96,13 +96,13 @@ type runRecordStats struct {
 	ArtistsToAdd                  int `json:"artists_to_add"`
 }
 
-type recordAlbum struct {
+type RecordAlbum struct {
 	ID     string `json:"id"`
 	Title  string `json:"title"`
 	Artist string `json:"artist"`
 }
 
-type recordArtist struct {
+type RecordArtist struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 }
@@ -146,7 +146,7 @@ func Run(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 
 	// 2. Load each playlist.
 	var allSongs []gateway.PlaylistSong
-	var sourcePlaylists []recordPlaylist
+	var sourcePlaylists []RecordPlaylist
 	var loadFailures []InputError
 	for _, in := range good {
 		songs, err := gw.ListPlaylistSongs(ctx, in.PlaylistID, opts.PageSize)
@@ -160,7 +160,7 @@ func Run(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 			continue
 		}
 		allSongs = append(allSongs, songs...)
-		sourcePlaylists = append(sourcePlaylists, recordPlaylist{
+		sourcePlaylists = append(sourcePlaylists, RecordPlaylist{
 			Input: in.Raw, PlaylistID: in.PlaylistID, SongCount: len(songs),
 		})
 		res.PlaylistsLoaded++
@@ -205,11 +205,11 @@ func Run(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 	plan := Diff(set, DiffInputs{LovedAlbumIDs: lovedAlbums, LovedArtistIDs: lovedArtists})
 
 	// 7. Run-record.
-	rec := runRecord{
+	rec := RunRecord{
 		Version:         1,
 		StartedAt:       res.StartedAt.Format(time.RFC3339),
 		SourcePlaylists: sourcePlaylists,
-		Stats: runRecordStats{
+		Stats: RunRecordStats{
 			SongsScanned:                  len(allSongs),
 			PlaylistsLoaded:               res.PlaylistsLoaded,
 			PlaylistsFailed:               res.PlaylistsFailed,
@@ -225,10 +225,10 @@ func Run(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 		},
 	}
 	for _, a := range plan.AlbumsToAdd {
-		rec.AlbumsToAdd = append(rec.AlbumsToAdd, recordAlbum{ID: a.ID, Title: a.Title, Artist: a.Artist})
+		rec.AlbumsToAdd = append(rec.AlbumsToAdd, RecordAlbum{ID: a.ID, Title: a.Title, Artist: a.Artist})
 	}
 	for _, a := range plan.ArtistsToAdd {
-		rec.ArtistsToAdd = append(rec.ArtistsToAdd, recordArtist{ID: a.ID, Name: a.Name})
+		rec.ArtistsToAdd = append(rec.ArtistsToAdd, RecordArtist{ID: a.ID, Name: a.Name})
 	}
 	recordPath, err := writeRunRecord(opts.BackupDir, res.StartedAt, rec)
 	if err != nil {
@@ -265,26 +265,64 @@ func Run(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 		return res, ErrAborted
 	}
 
-	// 11. Open skip log.
-	skipLog, skipPath, err := openSkipLog(opts.BackupDir, recordPath)
+	// 11–14. Apply phase, shared with ApplyFromRecord.
+	baseName := strings.TrimSuffix(filepath.Base(recordPath), ".json")
+	applyErr := applyPlan(ctx, gw, res, applyPlanOpts{
+		BackupDir:                   opts.BackupDir,
+		SkipLogBaseName:             baseName,
+		RetryBackoff:                opts.RetryBackoff,
+		MaxConsecutiveFinalFailures: maxConsec,
+	}, rec.AlbumsToAdd, rec.ArtistsToAdd)
+
+	fmt.Fprintf(opts.Stdout, "Added %d albums, %d artists, skipped %d", res.AddedAlbums, res.AddedArtists, res.SkippedItems)
+	if res.SkippedItems > 0 {
+		fmt.Fprintf(opts.Stdout, " (see %s)", res.SkipLogPath)
+	}
+	fmt.Fprintf(opts.Stdout, ", elapsed %s\n", res.Elapsed.Round(time.Second))
+
+	return res, applyErr
+}
+
+// applyPlan executes the apply phase: open the skip log, throttle/retry every
+// album add, then every artist add, with the streak circuit breaker. It is
+// shared between Run (full pipeline) and ApplyFromRecord (replay from an
+// edited record file).
+//
+// opts.SkipLogBaseName determines the skip-log filename; the caller is
+// responsible for deriving it from a record path or any other source. albums
+// and artists are the already-filtered, already-deduped slices to apply. res
+// is mutated in place — AddedAlbums, AddedArtists, SkippedItems, SkipLogPath,
+// Elapsed.
+//
+// Returns the same errors as before: ErrAuthFailed wrapped with the refresh-
+// arl message, the streak-breaker error, ctx.Err() on cancel, or a
+// "%d item(s) skipped" error when SkippedItems > 0.
+func applyPlan(
+	ctx context.Context,
+	gw Gateway,
+	res *Result,
+	opts applyPlanOpts,
+	albums []RecordAlbum,
+	artists []RecordArtist,
+) error {
+	skipLog, skipPath, err := openSkipLog(opts.BackupDir, opts.SkipLogBaseName)
 	if err != nil {
-		return res, fmt.Errorf("open skip log: %w", err)
+		return fmt.Errorf("open skip log: %w", err)
 	}
 	defer skipLog.Close()
 	res.SkipLogPath = skipPath
 
-	// 12. Apply phase A — albums.
 	streak := 0
-	for _, a := range plan.AlbumsToAdd {
+	for _, a := range albums {
 		select {
 		case <-ctx.Done():
 			res.Elapsed = time.Since(res.StartedAt)
-			return res, ctx.Err()
+			return ctx.Err()
 		default:
 		}
 		if err := throttle.Sleep(ctx); err != nil {
 			res.Elapsed = time.Since(res.StartedAt)
-			return res, err
+			return err
 		}
 		albumID := a.ID
 		err := throttle.RunOne(ctx, func(ctx context.Context) error {
@@ -297,33 +335,32 @@ func Run(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			res.Elapsed = time.Since(res.StartedAt)
-			return res, err
+			return err
 		}
 		var gerr *gateway.GatewayError
 		if errors.As(err, &gerr) && gerr.Kind == gateway.ErrAuthFailed {
 			res.Elapsed = time.Since(res.StartedAt)
-			return res, fmt.Errorf("auth failed during album apply (refresh your arl in ~/.config/deezer-tools/config.toml): %w", err)
+			return fmt.Errorf("auth failed during album apply (refresh your arl in ~/.config/deezer-tools/config.toml): %w", err)
 		}
 		res.SkippedItems++
 		_ = writeSkipEntry(skipLog, "album", a.ID, a.Title, a.Artist, err)
 		streak++
-		if maxConsec > 0 && streak >= maxConsec {
+		if opts.MaxConsecutiveFinalFailures > 0 && streak >= opts.MaxConsecutiveFinalFailures {
 			res.Elapsed = time.Since(res.StartedAt)
-			return res, fmt.Errorf("aborting: %d consecutive add failures (quota likely tripped or service degraded). Skipped items recorded in %s", streak, skipPath)
+			return fmt.Errorf("aborting: %d consecutive add failures (quota likely tripped or service degraded). Skipped items recorded in %s", streak, skipPath)
 		}
 	}
 
-	// 13. Apply phase B — artists.
-	for _, a := range plan.ArtistsToAdd {
+	for _, a := range artists {
 		select {
 		case <-ctx.Done():
 			res.Elapsed = time.Since(res.StartedAt)
-			return res, ctx.Err()
+			return ctx.Err()
 		default:
 		}
 		if err := throttle.Sleep(ctx); err != nil {
 			res.Elapsed = time.Since(res.StartedAt)
-			return res, err
+			return err
 		}
 		artistID := a.ID
 		err := throttle.RunOne(ctx, func(ctx context.Context) error {
@@ -336,41 +373,44 @@ func Run(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			res.Elapsed = time.Since(res.StartedAt)
-			return res, err
+			return err
 		}
 		var gerr *gateway.GatewayError
 		if errors.As(err, &gerr) && gerr.Kind == gateway.ErrAuthFailed {
 			res.Elapsed = time.Since(res.StartedAt)
-			return res, fmt.Errorf("auth failed during artist apply (refresh your arl in ~/.config/deezer-tools/config.toml): %w", err)
+			return fmt.Errorf("auth failed during artist apply (refresh your arl in ~/.config/deezer-tools/config.toml): %w", err)
 		}
 		res.SkippedItems++
 		_ = writeSkipEntry(skipLog, "artist", a.ID, a.Name, "", err)
 		streak++
-		if maxConsec > 0 && streak >= maxConsec {
+		if opts.MaxConsecutiveFinalFailures > 0 && streak >= opts.MaxConsecutiveFinalFailures {
 			res.Elapsed = time.Since(res.StartedAt)
-			return res, fmt.Errorf("aborting: %d consecutive add failures (quota likely tripped or service degraded). Skipped items recorded in %s", streak, skipPath)
+			return fmt.Errorf("aborting: %d consecutive add failures (quota likely tripped or service degraded). Skipped items recorded in %s", streak, skipPath)
 		}
 	}
 
-	// 14. Final summary.
 	res.Elapsed = time.Since(res.StartedAt)
-	fmt.Fprintf(opts.Stdout, "Added %d albums, %d artists, skipped %d", res.AddedAlbums, res.AddedArtists, res.SkippedItems)
 	if res.SkippedItems > 0 {
-		fmt.Fprintf(opts.Stdout, " (see %s)", skipPath)
+		return fmt.Errorf("%d item(s) skipped", res.SkippedItems)
 	}
-	fmt.Fprintf(opts.Stdout, ", elapsed %s\n", res.Elapsed.Round(time.Second))
+	return nil
+}
 
-	if res.SkippedItems > 0 {
-		return res, fmt.Errorf("%d item(s) skipped", res.SkippedItems)
-	}
-	return res, nil
+// applyPlanOpts is the tunables the apply loop needs from its caller.
+// SkipLogBaseName is the basename (without ".json") whose ".skip.log"
+// sibling will be created in BackupDir.
+type applyPlanOpts struct {
+	BackupDir                   string
+	SkipLogBaseName             string
+	RetryBackoff                []time.Duration
+	MaxConsecutiveFinalFailures int
 }
 
 func isYes(s string) bool {
 	return strings.EqualFold(strings.TrimSpace(s), "yes")
 }
 
-func writeRunRecord(dir string, started time.Time, rec runRecord) (string, error) {
+func writeRunRecord(dir string, started time.Time, rec RunRecord) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
@@ -404,9 +444,8 @@ func writeRunRecord(dir string, started time.Time, rec runRecord) (string, error
 	return final, nil
 }
 
-func openSkipLog(dir, recordPath string) (io.WriteCloser, string, error) {
-	base := strings.TrimSuffix(filepath.Base(recordPath), ".json")
-	skipPath := filepath.Join(dir, base+".skip.log")
+func openSkipLog(dir, baseName string) (io.WriteCloser, string, error) {
+	skipPath := filepath.Join(dir, baseName+".skip.log")
 	f, err := os.OpenFile(skipPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, "", err

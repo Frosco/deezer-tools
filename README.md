@@ -83,6 +83,37 @@ retry on rate-limit/5xx) protect against the gw-light quota that
 historically tripped Akamai's WAF on the wipe — see
 `docs/solutions/integration-issues/`.
 
+### `playlists apply-record`
+
+Apply a previously-written `love-contents` run record. Use this together with
+`love-contents --dry-run` to preview what would be loved, edit the record to
+exclude items you don't want, and then apply the edited record without
+re-running the load and dedup phases.
+
+```sh
+# 1. Dry-run writes the record file but does not apply.
+deezer-tools playlists love-contents --dry-run --backup-dir ./backups <inputs>...
+
+# 2. Edit the record to remove rows you don't want loved.
+$EDITOR ./backups/deezer-playlist-love-20260507T120000Z.json
+
+# 3. Apply the edited record. Re-fetches your loved sets and silently skips
+#    anything already loved.
+deezer-tools playlists apply-record ./backups/deezer-playlist-love-20260507T120000Z.json
+```
+
+Flags:
+
+- `--yes` — skip the confirm prompt (useful for scripted runs).
+- `--backup-dir <dir>` — directory for the apply skip log (defaults to `.`).
+
+The skip log is written to `<backup-dir>/<record-base>.applied-<UTC>.skip.log`
+when individual adds fail. No new run-record file is written.
+
+If the record's `version` field doesn't match what this build supports, the
+command refuses to run — this prevents silently applying a record from a
+future format that may have different semantics.
+
 ### `loved-albums dedupe`
 
 Find and remove duplicate entries in your loved-albums list:
