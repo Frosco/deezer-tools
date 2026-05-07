@@ -27,10 +27,11 @@ const supportedRecordVersion = 1
 // "stats" and "source_playlists" blocks are ignored at load time —
 // LoadRunRecord is a pure structural check.
 //
-// Both arrays absent (not just empty) is a structural error. json.Unmarshal
-// sets nil for missing arrays, but we can't distinguish missing-key from
-// empty-array here. We treat both as load-time success and let
-// ApplyFromRecord handle "nothing to apply".
+// "Both arrays absent" and "both arrays empty" collapse here: json.Unmarshal
+// surfaces nil for either case and we don't distinguish them. The design spec
+// listed the absent case as ErrMalformedRecord, but the practical effect of
+// rejecting it (vs. letting ApplyFromRecord short-circuit "nothing to apply")
+// is nil — so we accept it. TestLoadRunRecord_bothArraysEmpty pins that.
 func LoadRunRecord(path string) (*RunRecord, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

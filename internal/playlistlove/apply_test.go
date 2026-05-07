@@ -118,6 +118,32 @@ func TestLoadRunRecord_unknownTopLevelKeysIgnored(t *testing.T) {
 	}
 }
 
+func TestLoadRunRecord_bothArraysEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := writeRecordFile(t, dir, `{"version": 1, "albums_to_add": [], "artists_to_add": []}`)
+
+	rec, err := LoadRunRecord(path)
+	if err != nil {
+		t.Fatalf("LoadRunRecord: %v", err)
+	}
+	if len(rec.AlbumsToAdd) != 0 || len(rec.ArtistsToAdd) != 0 {
+		t.Errorf("expected empty slices, got %+v / %+v", rec.AlbumsToAdd, rec.ArtistsToAdd)
+	}
+}
+
+func TestLoadRunRecord_bothArraysAbsent(t *testing.T) {
+	dir := t.TempDir()
+	path := writeRecordFile(t, dir, `{"version": 1}`)
+
+	rec, err := LoadRunRecord(path)
+	if err != nil {
+		t.Fatalf("LoadRunRecord: %v", err)
+	}
+	if rec.AlbumsToAdd != nil || rec.ArtistsToAdd != nil {
+		t.Errorf("expected nil slices, got %+v / %+v", rec.AlbumsToAdd, rec.ArtistsToAdd)
+	}
+}
+
 func TestLoadRunRecord_missingFile(t *testing.T) {
 	_, err := LoadRunRecord("/nonexistent/path/record.json")
 	if err == nil || !os.IsNotExist(err) {
