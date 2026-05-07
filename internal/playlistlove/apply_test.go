@@ -372,6 +372,69 @@ func TestApplyFromRecord_assumeYesSkipsPrompt(t *testing.T) {
 	}
 }
 
+func TestApplyFromRecord_authFailureDuringListLovedAlbums(t *testing.T) {
+	dir := t.TempDir()
+	rec := &RunRecord{
+		Version:     1,
+		AlbumsToAdd: []RecordAlbum{{ID: "100"}},
+	}
+	gw := &fakeGateway{
+		listLovedAlbumsErr: &gateway.GatewayError{Kind: gateway.ErrAuthFailed, Method: "user.getAllFavoriteAlbums", Message: "USER_AUTH_REQUIRED"},
+	}
+	_, err := ApplyFromRecord(context.Background(), gw, defaultApplyOpts("yes\n", dir, rec))
+	if err == nil {
+		t.Fatal("err = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "refresh your arl") {
+		t.Errorf("err = %v, want refresh-arl hint", err)
+	}
+	if !strings.Contains(err.Error(), "list loved albums") {
+		t.Errorf("err = %v, want step name", err)
+	}
+}
+
+func TestApplyFromRecord_authFailureDuringListLovedArtists(t *testing.T) {
+	dir := t.TempDir()
+	rec := &RunRecord{
+		Version:      1,
+		ArtistsToAdd: []RecordArtist{{ID: "10"}},
+	}
+	gw := &fakeGateway{
+		listLovedArtistsErr: &gateway.GatewayError{Kind: gateway.ErrAuthFailed, Method: "user.getAllFavoriteArtists", Message: "USER_AUTH_REQUIRED"},
+	}
+	_, err := ApplyFromRecord(context.Background(), gw, defaultApplyOpts("yes\n", dir, rec))
+	if err == nil {
+		t.Fatal("err = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "refresh your arl") {
+		t.Errorf("err = %v, want refresh-arl hint", err)
+	}
+	if !strings.Contains(err.Error(), "list loved artists") {
+		t.Errorf("err = %v, want step name", err)
+	}
+}
+
+func TestApplyFromRecord_nonAuthFailureDuringListLoved(t *testing.T) {
+	dir := t.TempDir()
+	rec := &RunRecord{
+		Version:     1,
+		AlbumsToAdd: []RecordAlbum{{ID: "100"}},
+	}
+	gw := &fakeGateway{
+		listLovedAlbumsErr: &gateway.GatewayError{Kind: gateway.ErrServerError, Method: "user.getAllFavoriteAlbums", Message: "500"},
+	}
+	_, err := ApplyFromRecord(context.Background(), gw, defaultApplyOpts("yes\n", dir, rec))
+	if err == nil {
+		t.Fatal("err = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "list loved albums") {
+		t.Errorf("err = %v, want step name", err)
+	}
+	if strings.Contains(err.Error(), "refresh your arl") {
+		t.Errorf("err = %v, non-auth failure should NOT carry refresh-arl hint", err)
+	}
+}
+
 func TestApplyFromRecord_authFailureDuringApplyAborts(t *testing.T) {
 	dir := t.TempDir()
 	rec := &RunRecord{

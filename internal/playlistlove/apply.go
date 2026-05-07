@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/niref/deezer-tools/internal/gateway"
 	"github.com/niref/deezer-tools/internal/throttle"
 )
 
@@ -126,11 +127,11 @@ func ApplyFromRecord(ctx context.Context, gw Gateway, opts ApplyOptions) (*Resul
 	// Fetch the current loved sets.
 	lovedAlbums, err := gw.ListFavoriteAlbumIDs(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list loved albums: %w", err)
+		return nil, wrapLovedFetchErr("list loved albums", err)
 	}
 	lovedArtists, err := gw.ListFavoriteArtistIDs(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list loved artists: %w", err)
+		return nil, wrapLovedFetchErr("list loved artists", err)
 	}
 
 	// Filter already-loved items.
@@ -253,6 +254,18 @@ func dedupeArtists(in []RecordArtist) ([]RecordArtist, int) {
 		out = append(out, a)
 	}
 	return out, len(in) - len(out)
+}
+
+// wrapLovedFetchErr surfaces the standard refresh-arl hint when the loved-set
+// fetch failed because of expired/invalid auth, and falls back to a plain
+// "<step>: <err>" wrap otherwise. Mirrors the auth handling in applyPlan so
+// every failure mode of ApplyFromRecord carries the same actionable hint.
+func wrapLovedFetchErr(step string, err error) error {
+	var gerr *gateway.GatewayError
+	if errors.As(err, &gerr) && gerr.Kind == gateway.ErrAuthFailed {
+		return fmt.Errorf("auth failed during %s (refresh your arl in ~/.config/deezer-tools/config.toml): %w", step, err)
+	}
+	return fmt.Errorf("%s: %w", step, err)
 }
 
 // skipLogBaseName returns "<recordBase>.applied-<UTC>" where recordBase is
