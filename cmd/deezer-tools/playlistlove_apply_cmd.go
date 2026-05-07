@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/niref/deezer-tools/internal/config"
@@ -52,15 +51,6 @@ when individual adds fail. No new run-record file is written.`,
 				Stdout:     cmd.OutOrStdout(),
 				Stderr:     cmd.ErrOrStderr(),
 			})
-			if errors.Is(err, playlistlove.ErrAborted) {
-				return err
-			}
-			// Auth-failure on the loved-set fetch arrives unwrapped from
-			// ApplyFromRecord; surface it with the standard refresh-arl hint.
-			var gerr *gateway.GatewayError
-			if errors.As(err, &gerr) && gerr.Kind == gateway.ErrAuthFailed {
-				return fmt.Errorf("auth failed (refresh your arl in ~/.config/deezer-tools/config.toml): %w", err)
-			}
 			return err
 		},
 	}
