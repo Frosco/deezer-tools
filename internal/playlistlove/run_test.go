@@ -24,6 +24,8 @@ type fakeGateway struct {
 	addArtistErrs       map[string]error
 	addedAlbums         []string
 	addedArtists        []string
+	addAlbumCalls       int
+	addArtistCalls      int
 	listLovedAlbumsErr  error
 	listLovedArtistsErr error
 }
@@ -56,6 +58,7 @@ func (f *fakeGateway) GetAlbumMetadata(ctx context.Context, id string) (gateway.
 }
 
 func (f *fakeGateway) AddFavoriteAlbum(ctx context.Context, id string) error {
+	f.addAlbumCalls++
 	if err := f.addAlbumErrs[id]; err != nil {
 		return err
 	}
@@ -64,6 +67,7 @@ func (f *fakeGateway) AddFavoriteAlbum(ctx context.Context, id string) error {
 }
 
 func (f *fakeGateway) AddFavoriteArtist(ctx context.Context, id string) error {
+	f.addArtistCalls++
 	if err := f.addArtistErrs[id]; err != nil {
 		return err
 	}

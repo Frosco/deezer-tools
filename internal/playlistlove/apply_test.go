@@ -413,6 +413,9 @@ func TestApplyFromRecord_streakBreakerTrips(t *testing.T) {
 	if len(gw.addedAlbums) != 0 {
 		t.Errorf("addedAlbums = %v, want 0", gw.addedAlbums)
 	}
+	if gw.addAlbumCalls != 2 {
+		t.Errorf("addAlbumCalls = %d, want exactly 2 (breaker should abort after MaxConsecutiveFinalFailures)", gw.addAlbumCalls)
+	}
 }
 
 func TestApplyFromRecord_contextCancellation(t *testing.T) {
