@@ -49,6 +49,12 @@ func (f *fakeGateway) ListFavoriteArtistIDs(ctx context.Context) ([]string, erro
 	return f.lovedArtistIDs, nil
 }
 
+func (f *fakeGateway) GetAlbumMetadata(ctx context.Context, id string) (gateway.AlbumMetadata, error) {
+	// Default no-op for tests that don't exercise within-playlist dedup; if a
+	// test creates conflict groups it must use a richer fake (see diff_test.go).
+	return gateway.AlbumMetadata{}, nil
+}
+
 func (f *fakeGateway) AddFavoriteAlbum(ctx context.Context, id string) error {
 	if err := f.addAlbumErrs[id]; err != nil {
 		return err

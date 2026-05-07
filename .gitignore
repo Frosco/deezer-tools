@@ -12,6 +12,8 @@ deezer-loved-tracks-*.json
 deezer-loved-tracks-*.skip.log
 deezer-playlist-love-*.json
 deezer-playlist-love-*.skip.log
+deezer-loved-albums-dedupe-*.json
+deezer-loved-albums-dedupe-*.skip.log
 
 # Local config (never commit secrets)
 config.toml

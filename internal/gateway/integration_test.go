@@ -111,3 +111,67 @@ func TestIntegration_ListFavoriteArtistIDs(t *testing.T) {
 	}
 	t.Logf("loved artists: %d", len(ids))
 }
+
+func TestIntegration_GetAlbumMetadata_andTracks(t *testing.T) {
+	if os.Getenv("DEEZER_INTEGRATION") != "1" {
+		t.Skip("set DEEZER_INTEGRATION=1 to run")
+	}
+	c := New(loadIntegrationARL(t))
+	ctx := context.Background()
+
+	ids, err := c.ListFavoriteAlbumIDs(ctx)
+	if err != nil {
+		t.Fatalf("list loved albums: %v", err)
+	}
+	if len(ids) == 0 {
+		t.Skip("account has no loved albums; cannot run")
+	}
+
+	meta, err := c.GetAlbumMetadata(ctx, ids[0])
+	if err != nil {
+		t.Fatalf("GetAlbumMetadata(%s): %v", ids[0], err)
+	}
+	if meta.ID != ids[0] {
+		t.Errorf("ID round-trip: got %s, want %s", meta.ID, ids[0])
+	}
+	if meta.Title == "" || meta.ArtistID == "" || meta.ArtistName == "" {
+		t.Errorf("missing metadata: %+v", meta)
+	}
+	if meta.TrackCount <= 0 {
+		t.Errorf("TrackCount = %d", meta.TrackCount)
+	}
+	t.Logf("first loved album: %+v", meta)
+
+	// Find a long album for the tracklist test (or fall back to the first
+	// one if all loved albums are short).
+	probe := meta
+	for _, id := range ids {
+		if probe.TrackCount > 1 {
+			break
+		}
+		m, err := c.GetAlbumMetadata(ctx, id)
+		if err != nil {
+			continue
+		}
+		probe = m
+	}
+
+	tracks, err := c.ListAlbumTracks(ctx, probe.ID)
+	if err != nil {
+		t.Fatalf("ListAlbumTracks(%s): %v", probe.ID, err)
+	}
+	if len(tracks) == 0 {
+		t.Errorf("no tracks for %s", probe.ID)
+	}
+	if probe.TrackCount > 0 && len(tracks) != probe.TrackCount {
+		t.Errorf("tracks=%d, TrackCount=%d (mismatch may indicate flexString miss)",
+			len(tracks), probe.TrackCount)
+	}
+	for i, tr := range tracks {
+		if tr.ID == "" || tr.Title == "" {
+			t.Errorf("tracks[%d] missing fields: %+v", i, tr)
+		}
+	}
+	upto := min(3, len(tracks))
+	t.Logf("first %d tracks of %s: %+v", upto, probe.Title, tracks[:upto])
+}

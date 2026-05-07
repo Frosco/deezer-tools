@@ -4,11 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 )
 
 const (
-	pageProfileMethod      = "deezer.pageProfile"
-	addFavoriteAlbumMethod = "album.addFavorite"
+	pageProfileMethod         = "deezer.pageProfile"
+	addFavoriteAlbumMethod    = "album.addFavorite"
+	removeFavoriteAlbumMethod = "album.deleteFavorite"
+	getAlbumMetadataMethod    = "album.getData"
+	// listAlbumTracksMethod is in the song.* namespace, not album.*. Same
+	// kind of namespace-flip that bit us with album.getFavoriteIds (which
+	// doesn't exist; you use deezer.pageProfile). Verified in
+	// docs/superpowers/research/2026-05-05-deezer-album-protocol.md.
+	listAlbumTracksMethod = "song.getListByAlbum"
 	// pageProfileNb is the per-tab "give me everything" limit. The gateway is
 	// observed to honor large nb values and return a single page; if a real
 	// account hits truncation in the wild, switch to a smaller nb plus the
@@ -70,4 +78,125 @@ func (c *Client) AddFavoriteAlbum(ctx context.Context, albumID string) error {
 		return err
 	}
 	return nil
+}
+
+// RemoveFavoriteAlbum un-loves the album with the given Deezer ALB_ID.
+// Symmetric with AddFavoriteAlbum (album.addFavorite). On already-unloved,
+// the wet-run-discovered classification is DATA_ERROR → ErrNotFound; callers
+// treat that as a one-shot skip (do NOT retry).
+//
+// CSRF acquisition and refresh are handled by callWithCSRF.
+// Returns *GatewayError on classified failure.
+func (c *Client) RemoveFavoriteAlbum(ctx context.Context, albumID string) error {
+	body := map[string]any{"ALB_ID": albumID}
+	if _, err := c.callWithCSRF(ctx, removeFavoriteAlbumMethod, body); err != nil {
+		return err
+	}
+	return nil
+}
+
+// AlbumMetadata is the lightweight album record used by lovedalbums dedup
+// and by playlistlove's within-playlist Case-1 pass.
+type AlbumMetadata struct {
+	ID         string
+	Title      string
+	ArtistID   string
+	ArtistName string
+	FanCount   int
+	TrackCount int
+}
+
+// albumMetadataRecord is the on-the-wire shape of one album record returned
+// by album.getData. All ID-shaped fields use flexString — gw-light returns
+// IDs in mixed quoted/numeric forms within a single response payload, see
+// docs/solutions/design-patterns/gw-light-go-adapter-quirks-2026-04-28.md.
+// FanCount and TrackCount are also flexString — d-fi-core types NUMBER_TRACK
+// inconsistently across two interfaces, the same precedent that triggered
+// flexString adoption for SNG_ID.
+type albumMetadataRecord struct {
+	ID         flexString `json:"ALB_ID"`
+	Title      string     `json:"ALB_TITLE"`
+	ArtistID   flexString `json:"ART_ID"`
+	ArtistName string     `json:"ART_NAME"`
+	FanCount   flexString `json:"NB_FAN"`
+	TrackCount flexString `json:"NUMBER_TRACK"`
+}
+
+// GetAlbumMetadata fetches one album's metadata via gw-light album.getData.
+// CSRF acquisition and refresh-on-expiry are handled by callWithCSRF.
+func (c *Client) GetAlbumMetadata(ctx context.Context, albumID string) (AlbumMetadata, error) {
+	body := map[string]any{"ALB_ID": albumID}
+	raw, err := c.callWithCSRF(ctx, getAlbumMetadataMethod, body)
+	if err != nil {
+		return AlbumMetadata{}, err
+	}
+	var rec albumMetadataRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		return AlbumMetadata{}, fmt.Errorf("decode %s: %w", getAlbumMetadataMethod, err)
+	}
+	fans, err := parseFlexInt(rec.FanCount)
+	if err != nil {
+		return AlbumMetadata{}, fmt.Errorf("decode %s NB_FAN %q: %w", getAlbumMetadataMethod, string(rec.FanCount), err)
+	}
+	tracks, err := parseFlexInt(rec.TrackCount)
+	if err != nil {
+		return AlbumMetadata{}, fmt.Errorf("decode %s NUMBER_TRACK %q: %w", getAlbumMetadataMethod, string(rec.TrackCount), err)
+	}
+	return AlbumMetadata{
+		ID:         string(rec.ID),
+		Title:      rec.Title,
+		ArtistID:   string(rec.ArtistID),
+		ArtistName: rec.ArtistName,
+		FanCount:   fans,
+		TrackCount: tracks,
+	}, nil
+}
+
+// parseFlexInt parses a flexString that might arrive as a quoted string, a
+// bare JSON number, JSON null, or be absent. Returns 0, nil for empty/null
+// input (treated as "field missing or unset"). Returns 0, err if the content
+// is non-empty but not a valid integer — propagating lets PickWinner skip and
+// log the album rather than silently scoring it 0 on a tiebreaker dimension.
+func parseFlexInt(s flexString) (int, error) {
+	if s == "" || string(s) == "null" {
+		return 0, nil
+	}
+	return strconv.Atoi(string(s))
+}
+
+// AlbumTrack is one track on an album, used for Case-2 detection.
+type AlbumTrack struct {
+	ID    string
+	Title string
+}
+
+type albumTrackRecord struct {
+	ID    flexString `json:"SNG_ID"`
+	Title string     `json:"SNG_TITLE"`
+}
+
+// ListAlbumTracks returns the tracks on one album. Used only in phase 2 of
+// loved-albums dedup.
+//
+// gw-light's song.getListByAlbum returns all tracks in a single call when
+// passed nb=-1 (the convention across deemix/deezer-py/d-fi-core/RedSea). If
+// a wet run surfaces pagination, switch to a start/nb loop following
+// ListFavoriteSongs's stage-1 shape.
+func (c *Client) ListAlbumTracks(ctx context.Context, albumID string) ([]AlbumTrack, error) {
+	body := map[string]any{"ALB_ID": albumID, "nb": -1}
+	raw, err := c.callWithCSRF(ctx, listAlbumTracksMethod, body)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Data []albumTrackRecord `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", listAlbumTracksMethod, err)
+	}
+	out := make([]AlbumTrack, 0, len(resp.Data))
+	for _, r := range resp.Data {
+		out = append(out, AlbumTrack{ID: string(r.ID), Title: r.Title})
+	}
+	return out, nil
 }

@@ -27,6 +27,7 @@ type Gateway interface {
 	ListPlaylistSongs(ctx context.Context, playlistID string, pageSize int) ([]gateway.PlaylistSong, error)
 	ListFavoriteAlbumIDs(ctx context.Context) ([]string, error)
 	ListFavoriteArtistIDs(ctx context.Context) ([]string, error)
+	GetAlbumMetadata(ctx context.Context, albumID string) (gateway.AlbumMetadata, error)
 	AddFavoriteAlbum(ctx context.Context, albumID string) error
 	AddFavoriteArtist(ctx context.Context, artistID string) error
 }
@@ -81,17 +82,18 @@ type recordPlaylist struct {
 }
 
 type runRecordStats struct {
-	SongsScanned          int `json:"songs_scanned"`
-	PlaylistsLoaded       int `json:"playlists_loaded"`
-	PlaylistsFailed       int `json:"playlists_failed"`
-	UniqueAlbums          int `json:"unique_albums"`
-	UniqueArtists         int `json:"unique_artists"`
-	VariousArtistsSkipped int `json:"various_artists_skipped"`
-	UnparseableSongs      int `json:"unparseable_songs"`
-	AlbumsAlreadyLoved    int `json:"albums_already_loved"`
-	ArtistsAlreadyLoved   int `json:"artists_already_loved"`
-	AlbumsToAdd           int `json:"albums_to_add"`
-	ArtistsToAdd          int `json:"artists_to_add"`
+	SongsScanned                  int `json:"songs_scanned"`
+	PlaylistsLoaded               int `json:"playlists_loaded"`
+	PlaylistsFailed               int `json:"playlists_failed"`
+	UniqueAlbums                  int `json:"unique_albums"`
+	UniqueArtists                 int `json:"unique_artists"`
+	VariousArtistsSkipped         int `json:"various_artists_skipped"`
+	UnparseableSongs              int `json:"unparseable_songs"`
+	Case1WithinPlaylistSuppressed int `json:"case1_within_playlist_suppressed"`
+	AlbumsAlreadyLoved            int `json:"albums_already_loved"`
+	ArtistsAlreadyLoved           int `json:"artists_already_loved"`
+	AlbumsToAdd                   int `json:"albums_to_add"`
+	ArtistsToAdd                  int `json:"artists_to_add"`
 }
 
 type recordAlbum struct {
@@ -179,6 +181,14 @@ func Run(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 
 	// 4. Aggregate + dedupe.
 	set := Aggregate(allSongs, opts.VariousArtistsID)
+	set, err := CollapseCase1WithinPlaylist(ctx, gw, set, opts.RetryBackoff)
+	if err != nil {
+		var gerr *gateway.GatewayError
+		if errors.As(err, &gerr) && gerr.Kind == gateway.ErrAuthFailed {
+			return nil, fmt.Errorf("auth failed during within-playlist dedup (refresh your arl in ~/.config/deezer-tools/config.toml): %w", err)
+		}
+		return nil, fmt.Errorf("within-playlist dedup: %w", err)
+	}
 
 	// 5. Read loved sets. Both methods are single-call (deezer.pageProfile);
 	// no pagination knob needed — see the 2026-04-30 research doc.
@@ -200,17 +210,18 @@ func Run(ctx context.Context, gw Gateway, opts Options) (*Result, error) {
 		StartedAt:       res.StartedAt.Format(time.RFC3339),
 		SourcePlaylists: sourcePlaylists,
 		Stats: runRecordStats{
-			SongsScanned:          len(allSongs),
-			PlaylistsLoaded:       res.PlaylistsLoaded,
-			PlaylistsFailed:       res.PlaylistsFailed,
-			UniqueAlbums:          len(set.Albums),
-			UniqueArtists:         len(set.Artists),
-			VariousArtistsSkipped: set.VariousArtistsSkipped,
-			UnparseableSongs:      set.UnparseableSongs,
-			AlbumsAlreadyLoved:    plan.AlbumsAlreadyLoved,
-			ArtistsAlreadyLoved:   plan.ArtistsAlreadyLoved,
-			AlbumsToAdd:           len(plan.AlbumsToAdd),
-			ArtistsToAdd:          len(plan.ArtistsToAdd),
+			SongsScanned:                  len(allSongs),
+			PlaylistsLoaded:               res.PlaylistsLoaded,
+			PlaylistsFailed:               res.PlaylistsFailed,
+			UniqueAlbums:                  len(set.Albums),
+			UniqueArtists:                 len(set.Artists),
+			VariousArtistsSkipped:         set.VariousArtistsSkipped,
+			UnparseableSongs:              set.UnparseableSongs,
+			Case1WithinPlaylistSuppressed: set.Case1WithinPlaylistSuppressed,
+			AlbumsAlreadyLoved:            plan.AlbumsAlreadyLoved,
+			ArtistsAlreadyLoved:           plan.ArtistsAlreadyLoved,
+			AlbumsToAdd:                   len(plan.AlbumsToAdd),
+			ArtistsToAdd:                  len(plan.ArtistsToAdd),
 		},
 	}
 	for _, a := range plan.AlbumsToAdd {
