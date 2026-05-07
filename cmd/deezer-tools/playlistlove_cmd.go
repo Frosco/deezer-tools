@@ -19,6 +19,7 @@ func newPlaylistsCmd() *cobra.Command {
 		Short: "Tools that take Deezer playlists as a source",
 	}
 	cmd.AddCommand(newLoveContentsCmd())
+	cmd.AddCommand(newPlaylistsApplyRecordCmd())
 	return cmd
 }
 
